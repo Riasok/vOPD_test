@@ -1,0 +1,7 @@
+ruff check...............................................................Passed
+ruff format..............................................................Passed
+Check style with doc-builder.............................................Passed
+[feat/vopd 0d7508a] Add vOPD control-variate loss to DistillationTrainer
+ 7 files changed, 428 insertions(+), 2 deletions(-)
+ create mode 100644 examples/vopd/vopd.py
+ create mode 100644 tests/test_vopd.py

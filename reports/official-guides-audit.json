@@ -1,0 +1,58 @@
+[
+  {
+    "repository": "huggingface/trl",
+    "path": ".ai/AGENTS.md",
+    "url": "https://raw.githubusercontent.com/huggingface/trl/main/.ai/AGENTS.md",
+    "sha256": "7c4f501f94fd83cfcd7f7b0671ff0b752fc0da07de0cb8aa9573cd89be68be93",
+    "matches_checkout": true
+  },
+  {
+    "repository": "huggingface/trl",
+    "path": "CONTRIBUTING.md",
+    "url": "https://raw.githubusercontent.com/huggingface/trl/main/CONTRIBUTING.md",
+    "sha256": "a83404b441e3b5c03aecf71170060d5bf3235f7b4d0c6d771f1a4c887141f12e",
+    "matches_checkout": true
+  },
+  {
+    "repository": "huggingface/trl",
+    "path": ".github/PULL_REQUEST_TEMPLATE.md",
+    "url": "https://raw.githubusercontent.com/huggingface/trl/main/.github/PULL_REQUEST_TEMPLATE.md",
+    "sha256": "758913fc094194c66cef9fad35807be2e31064678ae030fb6fce8f1de4e24e4a",
+    "matches_checkout": true
+  },
+  {
+    "repository": "huggingface/trl",
+    "path": ".pre-commit-config.yaml",
+    "url": "https://raw.githubusercontent.com/huggingface/trl/main/.pre-commit-config.yaml",
+    "sha256": "fdfaeaff8d5d0849671106cff5af79677d348f2924c5613f29c6c12e0d3799f8",
+    "matches_checkout": true
+  },
+  {
+    "repository": "verl-project/verl",
+    "path": "AGENTS.md",
+    "url": "https://raw.githubusercontent.com/verl-project/verl/main/AGENTS.md",
+    "sha256": "5fdec7a5182a29335088b200caf43c59a8fb5226de228915126a54bfbaa8739f",
+    "matches_checkout": true
+  },
+  {
+    "repository": "verl-project/verl",
+    "path": "CONTRIBUTING.md",
+    "url": "https://raw.githubusercontent.com/verl-project/verl/main/CONTRIBUTING.md",
+    "sha256": "e14c78c285fd7b83f6108d86ee1a02b2d88234bc26374a169106b084b33965bd",
+    "matches_checkout": true
+  },
+  {
+    "repository": "verl-project/verl",
+    "path": ".github/PULL_REQUEST_TEMPLATE.md",
+    "url": "https://raw.githubusercontent.com/verl-project/verl/main/.github/PULL_REQUEST_TEMPLATE.md",
+    "sha256": "38cdeca3e7b209312cbb564e97cfc4d76ac4372cf6e1b1e27fecfcdd45b66e6f",
+    "matches_checkout": true
+  },
+  {
+    "repository": "verl-project/verl",
+    "path": ".pre-commit-config.yaml",
+    "url": "https://raw.githubusercontent.com/verl-project/verl/main/.pre-commit-config.yaml",
+    "sha256": "d0641de6cf53b246064f65c046fad963ae4074482ef861a87e038d1808b7e231",
+    "matches_checkout": true
+  }
+]

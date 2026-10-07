@@ -1,0 +1,18 @@
+ruff (legacy alias).............................................................Passed
+ruff format.....................................................................Passed
+mypy............................................................................Passed
+Generate and verify verl/trainer/config/_generated_*.yaml.......................Passed
+Check docs Last updated info....................................................Passed
+Check doc string coverage.......................................................Passed
+Check license...................................................................Passed
+Check device API usage..........................................................Passed
+Check DataProto usage...........................................................Passed
+Validate test structure.........................................................Passed
+Check naming conventions........................................................Passed
+Check example script naming convention..........................................Passed
+Check uv runs only on the GPU branch............................................Passed
+Compile all python files........................................................Passed
+[feat/vopd 38fd3b5] [fsdp, algo, rollout] feat: add vOPD distillation
+ 16 files changed, 830 insertions(+), 40 deletions(-)
+ create mode 100644 examples/on_policy_distillation_trainer/run_vopd_fsdp.sh
+ create mode 100644 tests/trainer/distillation/test_vopd_on_cpu.py

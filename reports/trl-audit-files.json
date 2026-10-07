@@ -1,0 +1,9 @@
+[
+  "docs/source/distillation_trainer.md",
+  "docs/source/paper_index.md",
+  "trl/experimental/server_distillation/server_distillation_config.py",
+  "trl/trainer/distillation_config.py",
+  "trl/trainer/distillation_trainer.py",
+  "examples/vopd/vopd.py",
+  "tests/test_vopd.py"
+]

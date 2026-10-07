@@ -1,0 +1,1128 @@
+diff --git a/docs/algo/opd.md b/docs/algo/opd.md
+index 2361226..f201c9b 100644
+--- a/docs/algo/opd.md
++++ b/docs/algo/opd.md
+@@ -2,7 +2,7 @@
+ 
+ **Author:** [Jacob Helwig](https://jacobhelwig.github.io/)
+ 
+-Last updated: 05/26/2026.
++Last updated: 10/07/2026.
+ 
+ ## Background
+ 
+@@ -777,3 +777,67 @@ The returned scalar loss is what `engine.train_batch` backpropagates.
+ - `tests/workers/test_distillation_topk_symmetry_on_cpu.py` — top-k loss symmetry and overlap metric checks
+ - `tests/utils/test_special_megatron_kl_loss_tp.py` — Megatron KL loss and overlap metrics under tensor parallelism
+ - `tests/special_e2e/run_v1_separate_async_opd.sh` — end-to-end multi-teacher OPD on the V1 separate_async trainer
++
++## vOPD: distillation with a control variate baseline
++
++[KL for a KL: On-Policy Distillation with Control Variate Baseline](https://arxiv.org/abs/2605.07865)
++uses the per-token advantage
++
++```text
++A = stop_gradient(log teacher(sampled_token) - log student(sampled_token) + baseline_KL)
++```
++
++The existing distillation policy-gradient loss consumes this advantage. `vopd_topk`
++renormalizes both distributions on the student's rollout top-k support to compute
++`baseline_KL`; `vopd_full` computes the baseline over the entire vocabulary. Both
++keep the sampled-token reward normalized over the full vocabulary. In particular,
++the sampled token is never appended to the baseline support. The baseline and
++teacher scores are detached. No critic or group normalization is used for this signal.
++
++### Supported configuration
++
++The initial implementation supports FSDP/FSDP2 actors, a vLLM teacher, text-only
++single-turn rollouts, temperature 1, and untruncated sampling. Student and teacher
++must share the same tokenizer and vocabulary-ID mapping. Fused model kernels and
++static `pad_to_length` are rejected because this implementation reads actor logits.
++Set `use_policy_gradient=True`, `loss_max_clamp=null`, and `log_prob_min_clamp=null`.
++Megatron and other teacher engines are not supported.
++
++```bash
++# From the verl root, after preparing the datasets used by the existing OPD recipe.
++# Model, GPU, dataset, and batch overrides are passed through to that recipe.
++VOPD_TOPK=20 bash examples/on_policy_distillation_trainer/run_vopd_fsdp.sh
++
++# Small-context full-vocabulary experiment. Start with a small batch and short response.
++VOPD_MODE=vopd_full TRAIN_BATCH_SIZE=2 PPO_MINI_BATCH_SIZE=2 \
++MAX_PROMPT_LENGTH=32 MAX_RESPONSE_LENGTH=32 \
++bash examples/on_policy_distillation_trainer/run_vopd_fsdp.sh
++```
++
++Top-k uses the rollout's `response_topk_ids`. vLLM 0.29 can return selected output
++token scores through `logprob_token_ids`, but cannot return a different selected
++support at each prompt position. The teacher client therefore requests one token
++on each student prefix, selecting the student's k IDs plus the actual sampled ID.
++It discards the teacher-generated token and retains the requested scores. Requests
++are bounded to eight in flight per teacher manager. Prefix caching can reduce repeated
++prefill work; this remains a latency-heavy path requiring throughput measurement
++before large runs. The score payload is O(Tk), and k must be between 1 and 127 due
++to vLLM 0.29's 128 selected-ID limit. The default example uses k=20 from the paper.
++
++Full-V is available with `prompt_logprobs=-1` and `max_logprobs=-1`. Returned
++teacher scores are reordered by vocabulary ID, shifted to prediction positions,
++and checked for complete vocabulary coverage. This transfers O(TV) scores and
++IDs, including prompt positions: approximately 2.3 GiB per 2,048-token sequence
++with V=150,000, before temporary buffers and batching. It is an experimental
++short-context path. The actor streams its full-V baseline through 256-token chunks
++to bound temporary FP32 softmax memory; the teacher payload itself remains O(TV).
++
++The top-k support is captured at rollout time. With one on-policy update it is
++the student's support; with policy reuse it is a fixed approximate support from
++the rollout policy. It remains independent of the sampled token. PPO clipping,
++stale rollouts, rollout corrections, and task rewards have their usual effects:
++only the detached baseline itself preserves the expected conditional token gradient.
++`use_task_rewards=False` gives pure distillation; the example sets this through
++the existing OPD launcher. The paper's value baseline is a practical approximation
++to the gradient-norm-weighted variance-optimal baseline, not a universal guarantee
++of lower variance on every context.
+diff --git a/examples/on_policy_distillation_trainer/README.md b/examples/on_policy_distillation_trainer/README.md
+index d3cbce2..b047813 100644
+--- a/examples/on_policy_distillation_trainer/README.md
++++ b/examples/on_policy_distillation_trainer/README.md
+@@ -22,3 +22,11 @@ the single-teacher scripts. The MOPD script exposes per-teacher overrides.
+ - `distillation.distillation_loss.loss_mode={k1, k3, forward_kl_topk, ...}`
+ - `distillation.distillation_loss.use_policy_gradient=True|False`
+ - `distillation.distillation_loss.topk=64`
++
++### vOPD
++
++`run_vopd_fsdp.sh` configures a detached reverse-KL control variate with the existing
++FSDP OPD trainer. `VOPD_MODE=vopd_topk` (default) uses the student's top-k support;
++`VOPD_MODE=vopd_full` requests the full teacher vocabulary. See
++[the vOPD documentation](../../docs/algo/opd.md#vopd-distillation-with-a-control-variate-baseline)
++for supported settings, sparse scoring latency, and full-vocabulary memory costs.
+diff --git a/examples/on_policy_distillation_trainer/run_vopd_fsdp.sh b/examples/on_policy_distillation_trainer/run_vopd_fsdp.sh
+new file mode 100644
+index 0000000..b0f41bb
+--- /dev/null
++++ b/examples/on_policy_distillation_trainer/run_vopd_fsdp.sh
+@@ -0,0 +1,30 @@
++#!/usr/bin/env bash
++# Run from the verl repository root. Inherits model/data/resource environment
++# variables from run_qwen3_8b_fsdp.sh; pass Hydra overrides as additional arguments.
++set -euo pipefail
++mode=${VOPD_MODE:-vopd_topk}
++k=${VOPD_TOPK:-20}
++if [[ "$mode" != vopd_topk && "$mode" != vopd_full ]]; then
++    echo 'VOPD_MODE must be vopd_topk or vopd_full' >&2
++    exit 1
++fi
++rollout_k=0
++if [[ "$mode" == vopd_topk ]]; then
++    rollout_k=$k
++fi
++DISTILLATION_LOSS_MODE="$mode" DISTILLATION_TOPK="$k" USE_POLICY_GRADIENT=True \
++bash examples/on_policy_distillation_trainer/run_qwen3_8b_fsdp.sh \
++    actor_rollout_ref.model.use_fused_kernels=False \
++    actor_rollout_ref.actor.use_fused_kernels=False \
++    actor_rollout_ref.actor.pad_to_length=False \
++    actor_rollout_ref.actor.ppo_epochs=1 \
++    actor_rollout_ref.rollout.temperature=1.0 \
++    actor_rollout_ref.rollout.top_p=1.0 \
++    actor_rollout_ref.rollout.top_k=-1 \
++    actor_rollout_ref.rollout.calculate_log_probs=True \
++    actor_rollout_ref.rollout.logprobs_mode=processed_logprobs \
++    actor_rollout_ref.rollout.topk_log_probs="$rollout_k" \
++    +distillation.teacher_models.teacher_model.inference.logprobs_mode=raw_logprobs \
++    distillation.distillation_loss.loss_max_clamp=null \
++    distillation.distillation_loss.log_prob_min_clamp=null \
++    "$@"
+diff --git a/tests/special_sanity/check_license.py b/tests/special_sanity/check_license.py
+index 425923a..0924fd5 100644
+--- a/tests/special_sanity/check_license.py
++++ b/tests/special_sanity/check_license.py
+@@ -22,6 +22,7 @@ license_head_bytedance_26 = "Copyright 2026 Bytedance Ltd. and/or its affiliates
+ # Add custom license headers below
+ license_head_prime = "Copyright 2024 PRIME team and/or its affiliates"
+ license_head_individual = "Copyright 2025 Individual Contributor:"
++license_head_individual_26 = "Copyright 2026 Individual Contributor:"
+ license_head_sglang = "Copyright 2023-2024 SGLang Team"
+ license_head_modelbest = "Copyright 2025 ModelBest Inc. and/or its affiliates"
+ license_head_amazon = "Copyright 2025 Amazon.com Inc and/or its affiliates"
+@@ -40,6 +41,7 @@ license_headers = [
+     license_head_bytedance_26,
+     license_head_prime,
+     license_head_individual,
++    license_head_individual_26,
+     license_head_sglang,
+     license_head_modelbest,
+     license_head_amazon,
+diff --git a/tests/trainer/distillation/test_vopd_on_cpu.py b/tests/trainer/distillation/test_vopd_on_cpu.py
+new file mode 100644
+index 0000000..affeb75
+--- /dev/null
++++ b/tests/trainer/distillation/test_vopd_on_cpu.py
+@@ -0,0 +1,369 @@
++# Copyright 2026 Individual Contributor: Riasok
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import asyncio
++from dataclasses import dataclass
++from unittest.mock import AsyncMock
++
++import pytest
++import torch
++from omegaconf import OmegaConf
++from tensordict import TensorDict
++
++from verl.experimental.teacher_loop.teacher_manager import AsyncTeacherLLMServerManager, _get_teacher_sampling_params
++from verl.trainer.distillation.losses import compute_topk_loss, distillation_loss
++from verl.utils.config import _validate_vopd_config
++from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig, DistillationTeacherModelConfig
++from verl.workers.config.rollout import RolloutConfig
++from verl.workers.rollout.replica import TokenOutput
++from verl.workers.utils.padding import no_padding_2_padding
++
++
++def loss_config(mode, topk=3):
++    return DistillationLossConfig(
++        loss_mode=mode,
++        topk=topk,
++        use_policy_gradient=True,
++        loss_max_clamp=None,
++        log_prob_min_clamp=None,
++        use_task_rewards=False,
++    )
++
++
++def nested(values, offsets):
++    return torch.nested.nested_tensor_from_jagged(values, offsets)
++
++
++@pytest.mark.parametrize("mode", ["vopd_topk", "vopd_full"])
++@pytest.mark.parametrize("k", [1, 3, 7])
++def test_vopd_pipeline_gradient(mode, k):
++    torch.manual_seed(8)
++    offsets = torch.tensor([0, 5, 9])
++    tokens = torch.tensor([1, 3, 2, 5, 6, 1, 4, 2, 3])
++    labels = tokens.roll(-1)
++    student = torch.randn(1, 9, 7, requires_grad=True)
++    teacher = torch.randn(1, 9, 7, requires_grad=True)
++    log_p, log_q = student.log_softmax(-1), teacher.log_softmax(-1)
++    support = student.detach().topk(k, -1).indices
++    if mode == "vopd_topk":
++        ids = torch.cat([support, labels.view(1, -1, 1)], -1)
++        scores = log_q.gather(-1, ids)
++        bp, bq = log_p.gather(-1, support).log_softmax(-1), log_q.gather(-1, support).log_softmax(-1)
++    else:
++        ids = torch.arange(7).expand(1, 9, 7)
++        scores = log_q
++        bp, bq = log_p, log_q
++    mask = torch.tensor([[1, 0, 1], [1, 1, 0]], dtype=torch.bool)
++    data = TensorDict(
++        {
++            "input_ids": nested(tokens, offsets),
++            "prompts": nested(torch.tensor([1, 3, 1, 4]), torch.tensor([0, 2, 4])),
++            "responses": nested(torch.tensor([2, 5, 6, 2, 3]), torch.tensor([0, 3, 5])),
++            "teacher_ids": nested(ids.squeeze(0), offsets),
++            "teacher_logprobs": nested(scores.squeeze(0), offsets),
++            "response_mask": mask,
++            "dp_size": 1,
++            "batch_num_tokens": mask.sum(),
++            "global_batch_size": 2,
++        },
++        batch_size=[],
++    )
++    config = DistillationConfig(distillation_loss=loss_config(mode, k))
++    actor = ActorConfig(strategy="fsdp", rollout_n=1, use_dynamic_bsz=True, loss_agg_mode="token-mean")
++    result = compute_topk_loss(actor, config, data, student, "thd")
++    expected_baseline = (bp.exp() * (bp - bq)).sum(-1)
++    torch.testing.assert_close(result["vopd_baseline"], expected_baseline)
++    assert all(not value.requires_grad for value in result.values())
++    sample_logps = log_p.gather(-1, labels.view(1, -1, 1)).squeeze(0).squeeze(-1)
++    model_output = {key: nested(value.squeeze(0), offsets) for key, value in result.items()}
++    model_output["log_probs"] = nested(sample_logps, offsets)
++    action_p = no_padding_2_padding(model_output["log_probs"], data)
++    data["old_log_probs"] = action_p.detach()
++    loss, metrics = distillation_loss(actor, config, model_output, data)
++    # PPO's ratio surrogate has the same gradient as -A*log(p) at current == old.
++    action_q = no_padding_2_padding(nested(log_q.gather(-1, labels.view(1, -1, 1)).view(-1), offsets), data)
++    base = no_padding_2_padding(nested(expected_baseline.view(-1), offsets), data)
++    reference = ((action_p - action_q - base).detach() * action_p * mask).sum() / mask.sum()
++    grad = torch.autograd.grad(loss, student, retain_graph=True)[0]
++    torch.testing.assert_close(
++        grad, torch.autograd.grad(reference, student, retain_graph=True)[0], atol=1e-6, rtol=1e-5
++    )
++    loss.backward()
++    assert teacher.grad is None
++    assert "distillation/vopd_baseline" in metrics
++
++
++@pytest.mark.parametrize(
++    "bad",
++    [
++        {"use_policy_gradient": False},
++        {"loss_max_clamp": 10.0},
++        {"log_prob_min_clamp": -10.0},
++        {"topk": 0},
++        {"topk": 128},
++    ],
++)
++def test_rejects_invalid_loss_settings(bad):
++    kwargs = dict(loss_mode="vopd_topk", topk=3, use_policy_gradient=True, loss_max_clamp=None, log_prob_min_clamp=None)
++    kwargs.update(bad)
++    with pytest.raises(ValueError):
++        DistillationLossConfig(**kwargs)
++
++
++def test_full_vocabulary_teacher_sampling():
++    teacher = DistillationTeacherModelConfig(inference=RolloutConfig(name="vllm", temperature=1))
++    assert _get_teacher_sampling_params(teacher, loss_config("vopd_full"))["prompt_logprobs"] == -1
++
++
++@pytest.fixture
++def teacher_manager():
++    config = OmegaConf.create(
++        {
++            "distillation": {
++                "_target_": "verl.workers.config.DistillationConfig",
++                "enabled": True,
++                "n_gpus_per_node": 1,
++                "nnodes": 1,
++                "teacher_models": {
++                    "teacher_model": {
++                        "_target_": "verl.workers.config.DistillationTeacherModelConfig",
++                        "model_path": "test-model",
++                        "inference": {
++                            "_target_": "verl.workers.config.RolloutConfig",
++                            "name": "vllm",
++                            "tensor_model_parallel_size": 1,
++                            "logprobs_mode": "raw_logprobs",
++                        },
++                    }
++                },
++                "distillation_loss": {
++                    "_target_": "verl.workers.config.DistillationLossConfig",
++                    "loss_mode": "vopd_topk",
++                    "topk": 2,
++                    "use_policy_gradient": True,
++                    "loss_max_clamp": None,
++                    "log_prob_min_clamp": None,
++                },
++            }
++        }
++    )
++    client = AsyncMock()
++    return AsyncTeacherLLMServerManager(config, {"default": client}), client
++
++
++@pytest.mark.asyncio
++async def test_teacher_scores_student_support_and_separate_sample_column(teacher_manager):
++    # Only the remote client is mocked; routing and configuration are real.
++    manager, client = teacher_manager
++
++    async def generate(**kwargs):
++        requested = kwargs["sampling_params"]["logprob_token_ids"]
++        return TokenOutput(token_ids=[0], extra_fields={"requested_token_logprobs": [-float(i + 1) for i in requested]})
++
++    client.generate.side_effect = generate
++    ids, scores = await manager.compute_teacher_logprobs_single(
++        sequence_ids=[1, 2, 3, 6], prompt_length=2, student_topk_ids=[[3, 4], [2, 4]]
++    )
++    assert ids.tolist()[1:3] == [[3, 4, 3], [2, 4, 6]]
++    assert scores.tolist()[1:3] == [[-4, -5, -4], [-3, -5, -7]]
++    requests = client.generate.call_args_list
++    assert requests[0].kwargs["prompt_ids"] == [1, 2]
++    assert requests[1].kwargs["prompt_ids"] == [1, 2, 3]
++    assert requests[0].kwargs["sampling_params"]["logprob_token_ids"] == [3, 4]
++    assert requests[1].kwargs["sampling_params"]["logprob_token_ids"] == [2, 4, 6]
++    # Prefix and last-token rows are dummies; only correctly shifted response rows are scored.
++    assert torch.count_nonzero(scores[[0, 3]]) == 0
++    with pytest.raises(ValueError, match="distinct"):
++        await manager.compute_teacher_logprobs_single(
++            sequence_ids=[1, 2, 3, 6], prompt_length=2, student_topk_ids=[[3, 3], [2, 4]]
++        )
++
++
++def test_rejects_unsupported_actor_backend():
++    config = OmegaConf.create(
++        {
++            "distillation": {"enabled": True, "distillation_loss": {"loss_mode": "vopd_topk"}},
++            "actor_rollout_ref": {"actor": {"strategy": "megatron"}, "rollout": {}},
++        }
++    )
++    with pytest.raises(ValueError, match="FSDP"):
++        _validate_vopd_config(config)
++
++
++@dataclass
++class Logprob:
++    # Wire-level vLLM result fixture; importing vLLM is unnecessary for parsing.
++    logprob: float
++    rank: int | None = None
++
++
++@dataclass
++class PromptOutput:
++    prompt_logprobs: list
++
++
++def test_full_vocabulary_wire_parsing_and_alignment():
++    from verl.workers.rollout.utils import extract_prompt_logprobs
++
++    output = PromptOutput(
++        [None, {2: Logprob(-3), 0: Logprob(-1), 1: Logprob(-2)}, {1: Logprob(-4), 2: Logprob(-5), 0: Logprob(-6)}]
++    )
++    result = {}
++    extract_prompt_logprobs(output, -1, result)
++    assert result["prompt_ids"] == [[0, 1, 2], [0, 1, 2], [0, 1, 2]]
++    assert result["prompt_logprobs"] == [[-1, -2, -3], [-6, -4, -5], [0, 0, 0]]
++    with pytest.raises(ValueError, match="contiguous"):
++        extract_prompt_logprobs(PromptOutput([None, {0: Logprob(-1), 2: Logprob(-3)}]), -1, {})
++
++
++def test_existing_topk_and_sampled_wire_parsing():
++    from verl.workers.rollout.utils import extract_prompt_logprobs, extract_requested_token_logprobs
++
++    output = PromptOutput([None, {4: Logprob(-5, 5), 0: Logprob(-1, 1), 2: Logprob(-2, 2)}])
++    result = {}
++    extract_prompt_logprobs(output, 2, result)
++    assert result == {"prompt_ids": [[0, 2], [0, 0]], "prompt_logprobs": [[-1, -2], [0, 0]]}
++    extract_prompt_logprobs(output, 0, result)
++    assert result == {"prompt_ids": [[4], [0]], "prompt_logprobs": [[-5], [0]]}
++    assert extract_requested_token_logprobs(output.prompt_logprobs[1], [2, 4]) == [-2, -5]
++
++
++@pytest.mark.parametrize("mode", ["vopd_topk", "vopd_full"])
++def test_composed_hydra_recipe(mode):
++    from pathlib import Path
++
++    from hydra import compose, initialize_config_dir
++
++    from verl.utils.config import omega_conf_to_dataclass
++
++    config_dir = Path(__file__).resolve().parents[3] / "verl" / "trainer" / "config"
++    overrides = [
++        "distillation.enabled=True",
++        "distillation.n_gpus_per_node=1",
++        "distillation.nnodes=1",
++        "distillation.teacher_models.teacher_model.model_path=test-model",
++        "distillation.teacher_models.teacher_model.inference.tensor_model_parallel_size=1",
++        "distillation.teacher_models.teacher_model.inference.name=vllm",
++        "+distillation.teacher_models.teacher_model.inference.logprobs_mode=raw_logprobs",
++        f"distillation.distillation_loss.loss_mode={mode}",
++        "distillation.distillation_loss.topk=20",
++        "distillation.distillation_loss.use_policy_gradient=True",
++        "distillation.distillation_loss.use_task_rewards=False",
++        "distillation.distillation_loss.loss_max_clamp=null",
++        "distillation.distillation_loss.log_prob_min_clamp=null",
++        "actor_rollout_ref.rollout.name=vllm",
++        "actor_rollout_ref.rollout.temperature=1.0",
++        "actor_rollout_ref.rollout.top_p=1.0",
++        "actor_rollout_ref.rollout.top_k=-1",
++        "actor_rollout_ref.rollout.calculate_log_probs=True",
++        "actor_rollout_ref.rollout.logprobs_mode=processed_logprobs",
++        f"actor_rollout_ref.rollout.topk_log_probs={20 if mode == 'vopd_topk' else 0}",
++        "actor_rollout_ref.model.use_fused_kernels=False",
++        "actor_rollout_ref.actor.use_fused_kernels=False",
++        "actor_rollout_ref.actor.pad_to_length=False",
++        "actor_rollout_ref.actor.ppo_epochs=1",
++    ]
++    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
++        config = compose(config_name="ppo_trainer", overrides=overrides)
++    _validate_vopd_config(config)
++    for key, value in [("do_sample", False), ("temperature", 0.7), ("top_p", 0.9), ("top_k", 5)]:
++        invalid = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
++        invalid.actor_rollout_ref.rollout[key] = value
++        with pytest.raises(ValueError, match="do_sample=True"):
++            _validate_vopd_config(invalid)
++    resolved = omega_conf_to_dataclass(config.distillation)
++    assert resolved.distillation_loss.loss_mode == mode
++    teacher = resolved.teacher_models["default"].inference
++    assert teacher.logprobs_mode == "raw_logprobs"
++    assert teacher.engine_kwargs["vllm"]["max_logprobs"] == (-1 if mode == "vopd_full" else 20)
++
++
++@pytest.mark.asyncio
++async def test_teacher_concurrency_is_bounded_across_trajectories(teacher_manager):
++    manager, client = teacher_manager
++    active = peak = 0
++
++    async def generate(**kwargs):
++        nonlocal active, peak
++        active += 1
++        peak = max(peak, active)
++        try:
++            await asyncio.sleep(0.001)
++            requested = kwargs["sampling_params"]["logprob_token_ids"]
++            return TokenOutput(token_ids=[0], extra_fields={"requested_token_logprobs": [-1.0] * len(requested)})
++        finally:
++            active -= 1
++
++    client.generate.side_effect = generate
++    await asyncio.gather(
++        *(
++            manager.compute_teacher_logprobs_single([1] * 21, prompt_length=1, student_topk_ids=[[1, 2]] * 20)
++            for _ in range(3)
++        )
++    )
++    assert client.generate.await_count == 60
++    assert peak == 8
++    assert active == 0
++
++
++@pytest.mark.asyncio
++async def test_failed_teacher_request_cancels_remaining_work(teacher_manager):
++    manager, client = teacher_manager
++    active = 0
++    started = asyncio.Event()
++
++    async def generate(**kwargs):
++        nonlocal active
++        active += 1
++        if active == 8:
++            started.set()
++        try:
++            await started.wait()
++            if len(kwargs["prompt_ids"]) == 1:
++                raise RuntimeError("remote teacher failed")
++            await asyncio.Event().wait()
++        finally:
++            active -= 1
++
++    client.generate.side_effect = generate
++    with pytest.raises(RuntimeError, match="remote teacher failed"):
++        await asyncio.wait_for(
++            manager.compute_teacher_logprobs_single([1] * 21, prompt_length=1, student_topk_ids=[[1, 2]] * 20),
++            timeout=5,
++        )
++    assert active == 0
++
++
++@pytest.mark.parametrize("chunk_size", [1, 17, 256, 300])
++def test_full_vocabulary_baseline_chunk_boundary(chunk_size):
++    from verl.trainer.distillation.fsdp.losses import compute_vopd_baseline
++
++    torch.manual_seed(13)
++    student = torch.randn(1, 270, 7, requires_grad=True)
++    teacher = torch.randn_like(student).log_softmax(-1)
++    offsets = torch.tensor([0, 270])
++    labels = torch.arange(270) % 7
++    data = TensorDict(
++        {
++            "input_ids": nested(labels, offsets),
++            "teacher_logprobs": nested(teacher.squeeze(0), offsets),
++        },
++        batch_size=[],
++    )
++    result = compute_vopd_baseline(
++        student, data, DistillationConfig(distillation_loss=loss_config("vopd_full")), chunk_size
++    )
++    log_probs = student.log_softmax(-1)
++    torch.testing.assert_close(result["vopd_baseline"], (log_probs.exp() * (log_probs - teacher)).sum(-1))
++    assert not result["vopd_baseline"].requires_grad
+diff --git a/tests/workers/test_distillation_topk_symmetry_on_cpu.py b/tests/workers/test_distillation_topk_symmetry_on_cpu.py
+index 504ba55..c3d4387 100644
+--- a/tests/workers/test_distillation_topk_symmetry_on_cpu.py
++++ b/tests/workers/test_distillation_topk_symmetry_on_cpu.py
+@@ -248,3 +248,69 @@ def test_forward_kl_topk_metric_aggregation_for_overlap_outputs():
+ 
+     assert metrics["distillation/overlap_ratio"] == pytest.approx(0.75)
+     assert metrics["distillation/overlap_token_advantage"] == pytest.approx(-0.3)
++
++
++@pytest.mark.parametrize("use_remove_padding", [True, False])
++@pytest.mark.parametrize("mode", ["vopd_topk", "vopd_full"])
++def test_vopd_baseline_through_fsdp_output_processor(use_remove_padding, mode, monkeypatch):
++    from transformers.modeling_outputs import CausalLMOutput
++
++    from verl.trainer.distillation.losses import compute_topk_loss
++    from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
++
++    monkeypatch.setenv("VERL_DISABLE_FLASH_ATTN_CE", "1")
++    offsets = torch.tensor([0, 3, 5])
++    tokens = torch.tensor([1, 2, 3, 1, 4])
++    logits = torch.randn(1, 5, _VOCAB_SIZE, requires_grad=True)
++    teacher_logps = torch.randn_like(logits).log_softmax(-1)
++    labels = tokens.roll(-1)
++    if mode == "vopd_topk":
++        support = logits.detach().topk(2, -1).indices
++        teacher_ids = torch.cat([support, labels.view(1, -1, 1)], -1)
++        teacher_logps = teacher_logps.gather(-1, teacher_ids)
++    else:
++        teacher_ids = torch.arange(_VOCAB_SIZE).expand(1, 5, _VOCAB_SIZE)
++    data = TensorDict(
++        {
++            "input_ids": torch.nested.nested_tensor_from_jagged(tokens, offsets),
++            "teacher_ids": torch.nested.nested_tensor_from_jagged(teacher_ids.squeeze(0), offsets),
++            "teacher_logprobs": torch.nested.nested_tensor_from_jagged(teacher_logps.squeeze(0), offsets),
++        },
++        batch_size=[],
++    )
++    tu.assign_non_tensor(
++        data,
++        use_remove_padding=use_remove_padding,
++        pad_mode=DatasetPadMode.NO_PADDING,
++        use_fused_kernels=False,
++        calculate_entropy=False,
++        calculate_sum_pi_squared=False,
++        distillation_use_topk=True,
++        distillation_only=False,
++    )
++    actor = ActorConfig(strategy="fsdp", rollout_n=1, use_dynamic_bsz=True)
++    config = DistillationConfig(
++        distillation_loss=DistillationLossConfig(
++            loss_mode=mode, topk=2, use_policy_gradient=True, loss_max_clamp=None, log_prob_min_clamp=None
++        )
++    )
++
++    def processor(student_logits, data):
++        return compute_topk_loss(actor, config, data, student_logits, "thd")
++
++    expected = processor(logits, data)
++    if use_remove_padding:
++        output = CausalLMOutput(logits=logits)
++        args = {"input_ids_rmpad_rolled": labels, "temperature_rmpad": torch.ones(5), "pad_size": 0}
++    else:
++        padded = torch.stack([logits[0, :3], torch.cat([logits[0, 3:], torch.zeros(1, _VOCAB_SIZE)])])
++        output = CausalLMOutput(logits=padded)
++        args = {"input_ids_rmpad_rolled": labels, "temperature": torch.ones(2)}
++    model_output = _make_engine_stub().prepare_model_outputs(output, args, data, processor)
++    for key, value in expected.items():
++        torch.testing.assert_close(model_output[key].values(), value.squeeze(0))
++        assert not model_output[key].requires_grad
++    reference_logps = logits.log_softmax(-1).gather(-1, labels.view(1, -1, 1)).reshape(-1)
++    torch.testing.assert_close(model_output["log_probs"].values(), reference_logps)
++    model_output["log_probs"].values().sum().backward()
++    assert logits.grad is not None and torch.isfinite(logits.grad).all()
+diff --git a/verl/experimental/agent_loop/agent_loop.py b/verl/experimental/agent_loop/agent_loop.py
+index 306d01e..b0e7365 100644
+--- a/verl/experimental/agent_loop/agent_loop.py
++++ b/verl/experimental/agent_loop/agent_loop.py
+@@ -612,6 +612,10 @@ class AgentLoopWorker:
+             logprobs=config.calculate_log_probs,
+         )
+ 
++        # the trainer never consumes the sampler head on validation rollouts
++        if config.topk_log_probs and not validate:
++            sampling_params["topk_log_probs"] = config.topk_log_probs
++
+         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+             params["top_p"] = 1.0
+             params["top_k"] = -1
+@@ -1055,6 +1059,11 @@ class AgentLoopWorker:
+     ) -> None:
+         """Compute teacher logprobs for single sample."""
+         if self.distillation_enabled and not validate:
++            if self.teacher_server_manager.distillation_loss_config.loss_mode in {"vopd_topk", "vopd_full"}:
++                if output.num_turns > 2:
++                    raise ValueError("vOPD currently supports single-turn rollouts only.")
++                if output.multi_modal_data:
++                    raise NotImplementedError("vOPD currently supports text-only rollouts.")
+             routing_key = None
+             if sample_kwargs is not None:
+                 routing_value = sample_kwargs.get(self.teacher_key)
+@@ -1067,6 +1076,8 @@ class AgentLoopWorker:
+                 mm_processor_kwargs=output.mm_processor_kwargs,
+                 mm_processor_output=getattr(output, "mm_processor_output", None),
+                 routing_key=routing_key,
++                student_topk_ids=output.extra_fields.get("response_topk_ids"),
++                prompt_length=len(prompt_ids),
+             )
+             output.extra_fields["teacher_ids"] = teacher_ids
+             output.extra_fields["teacher_logprobs"] = teacher_logprobs
+diff --git a/verl/experimental/teacher_loop/teacher_manager.py b/verl/experimental/teacher_loop/teacher_manager.py
+index 7dacd64..8a791be 100644
+--- a/verl/experimental/teacher_loop/teacher_manager.py
++++ b/verl/experimental/teacher_loop/teacher_manager.py
+@@ -11,6 +11,7 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++import asyncio
+ import logging
+ import os
+ from typing import Any, Optional
+@@ -49,6 +50,8 @@ def _get_teacher_sampling_params(
+             teacher_model_config.inference.temperature,
+         )
+     num_logprobs = distillation_loss_config.topk if distillation_loss_config.loss_settings.use_topk else 0
++    if distillation_loss_config.loss_mode == "vopd_full":
++        num_logprobs = -1
+     return {
+         "max_tokens": 1,
+         "temperature": 1.0,
+@@ -96,6 +99,8 @@ class AsyncTeacherLLMServerManager:
+                 f"do not match teacher routing keys {sorted(expected)}."
+             )
+         self.teacher_client: dict[str, LLMServerClient] = teacher_client
++        # Bound selective scoring across all trajectories handled by this manager.
++        self._vopd_semaphore = asyncio.Semaphore(8)
+ 
+     def _resolve_teacher_key(self, routing_key: Optional[str]) -> str:
+         if len(self.teacher_model_configs) == 1:
+@@ -120,12 +125,18 @@ class AsyncTeacherLLMServerManager:
+         mm_processor_kwargs: Optional[dict[str, Any]] = None,
+         mm_processor_output: Optional[list[dict[str, Any]]] = None,
+         routing_key: Optional[str] = None,
++        student_topk_ids: Optional[list[list[int]]] = None,
++        prompt_length: Optional[int] = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         """Compute teacher log probabilities for a single unpadded sequence."""
+         multi_modal_data = multi_modal_data or {}
+         teacher_key = self._resolve_teacher_key(routing_key)
+         teacher_model_config = self.teacher_model_configs[teacher_key]
+         client = self.teacher_client[teacher_key]
++        if self.distillation_loss_config.loss_mode == "vopd_topk":
++            if multi_modal_data:
++                raise NotImplementedError("vOPD selective prefix scoring currently supports text-only sequences.")
++            return await self._score_student_support(client, sequence_ids, student_topk_ids, prompt_length)
+         teacher_output = await client.generate(
+             request_id=uuid4().hex,
+             prompt_ids=sequence_ids,
+@@ -142,3 +153,73 @@ class AsyncTeacherLLMServerManager:
+         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
+         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
+         return teacher_ids, teacher_logprobs
++
++    async def _score_student_support(
++        self,
++        client: LLMServerClient,
++        sequence_ids: list[int],
++        student_topk_ids: Optional[list[list[int]]],
++        prompt_length: Optional[int],
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """Score each student support with a one-token vLLM request on its prefix.
++
++        vLLM 0.29 supports selected output logprobs, but not per-position selected
++        prompt logprobs. Prefix requests bound score transfer to O(T*k), at the
++        cost of T prefills. Prefix caching on the teacher can amortize those prefills.
++        """
++        k = self.distillation_loss_config.topk
++        if prompt_length is None or not 1 <= prompt_length <= len(sequence_ids) or student_topk_ids is None:
++            raise ValueError("vOPD top-k requires the student rollout's response_topk_ids and prompt length.")
++        response_length = len(sequence_ids) - prompt_length
++        if response_length == 0:
++            ids = torch.cat([torch.arange(k), torch.zeros(1, dtype=torch.long)]).repeat(len(sequence_ids), 1)
++            return ids.to(torch.int32), torch.zeros(len(sequence_ids), k + 1)
++        support = torch.as_tensor(student_topk_ids, dtype=torch.long)
++        if support.shape != (response_length, k):
++            raise ValueError(f"Expected student top-k shape {(response_length, k)}, got {tuple(support.shape)}.")
++        if (support.sort(-1).values.diff(dim=-1) == 0).any():
++            raise ValueError("Student top-k support must contain k distinct tokens at each position.")
++        # Dummy prompt/last rows are masked out. Give them a valid distinct support.
++        ids = torch.cat([torch.arange(k), torch.zeros(1, dtype=torch.long)]).repeat(len(sequence_ids), 1)
++        scores = torch.zeros(len(sequence_ids), k + 1)
++
++        async def score_position(index):
++            position = prompt_length + index
++            requested = support[index].tolist() + [sequence_ids[position]]
++            # The sampled token may already be in the baseline support. Query it once,
++            # then restore a separate final column so it never changes that support.
++            unique = list(dict.fromkeys(requested))
++            async with self._vopd_semaphore:
++                output = await client.generate(
++                    request_id=uuid4().hex,
++                    prompt_ids=sequence_ids[:position],
++                    sampling_params={
++                        "max_tokens": 1,
++                        "temperature": 1.0,
++                        "detokenize": False,
++                        "logprob_token_ids": unique,
++                    },
++                )
++            returned = output.extra_fields["requested_token_logprobs"]
++            if len(returned) != len(unique):
++                raise ValueError("Teacher did not return all requested token scores.")
++            by_id = dict(zip(unique, returned, strict=True))
++            ids[position - 1] = torch.tensor(requested)
++            scores[position - 1] = torch.tensor([by_id[token] for token in requested])
++
++        # A fixed worker count also avoids creating one task per response token.
++        positions = iter(range(response_length))
++
++        async def score_positions():
++            for index in positions:
++                await score_position(index)
++
++        tasks = [asyncio.create_task(score_positions()) for _ in range(min(8, response_length))]
++        try:
++            await asyncio.gather(*tasks)
++        finally:
++            # A failed/cancelled trajectory must not leave teacher requests running.
++            for task in tasks:
++                task.cancel()
++            await asyncio.gather(*tasks, return_exceptions=True)
++        return ids.to(torch.int32), scores
+diff --git a/verl/trainer/config/distillation/distillation.yaml b/verl/trainer/config/distillation/distillation.yaml
+index 84ee793..883152e 100644
+--- a/verl/trainer/config/distillation/distillation.yaml
++++ b/verl/trainer/config/distillation/distillation.yaml
+@@ -20,7 +20,8 @@ distillation_loss:
+   _target_: verl.workers.config.DistillationLossConfig
+ 
+ 
+-  # Loss function mode for distillation
++  # Loss function mode for distillation. vopd_topk/vopd_full require
++  # use_policy_gradient=true and both clamps=null; see docs/algo/opd.md.
+   loss_mode: k3
+ 
+   # If distillation loss requires top-k logits, this is the value of k
+diff --git a/verl/trainer/distillation/fsdp/losses.py b/verl/trainer/distillation/fsdp/losses.py
+index 602d387..3f05412 100644
+--- a/verl/trainer/distillation/fsdp/losses.py
++++ b/verl/trainer/distillation/fsdp/losses.py
+@@ -15,6 +15,7 @@
+ 
+ import torch
+ import torch.nn.functional as F
++from tensordict import TensorDict
+ 
+ from verl.utils.ulysses import (
+     get_ulysses_sequence_parallel_world_size,
+@@ -147,3 +148,50 @@ def compute_forward_kl_topk(
+         "overlap_count": overlap_count,
+         "overlap_token_advantage": overlap_token_advantage,
+     }
++
++
++@torch.no_grad()
++def compute_vopd_baseline(
++    student_logits: torch.Tensor,
++    data: TensorDict,
++    config: DistillationConfig,
++    chunk_size: int = 256,
++) -> dict[str, torch.Tensor]:
++    """Compute a detached reverse-KL baseline and the teacher's sampled-token score.
++
++    For vopd_topk, teacher columns are [student rollout top-k, sampled token].
++    The final sampled-token column is excluded from the baseline support.
++    For vopd_full, teacher columns are in vocabulary-ID order. Stream the
++    full-vocabulary softmax in token chunks to bound temporary FP32 memory.
++    """
++    teacher_log_probs = data["teacher_logprobs"].values().unsqueeze(0).detach()
++    if get_ulysses_sequence_parallel_world_size() > 1:
++        teacher_log_probs = slice_input_tensor(teacher_log_probs, dim=1)
++    if teacher_log_probs.shape[:2] != student_logits.shape[:2]:
++        raise ValueError("vOPD teacher scores must align with student prediction positions.")
++    if config.distillation_loss.loss_mode == "vopd_topk":
++        topk = config.distillation_loss.topk
++        if teacher_log_probs.shape[-1] != topk + 1:
++            raise ValueError("vOPD top-k requires k baseline columns plus a separate sampled-token column.")
++        support_ids = data["teacher_ids"].values()[..., :topk].unsqueeze(0).long()
++        if get_ulysses_sequence_parallel_world_size() > 1:
++            support_ids = slice_input_tensor(support_ids, dim=1)
++        student_log_probs = F.log_softmax(student_logits.gather(-1, support_ids).float(), dim=-1)
++        teacher_support_log_probs = F.log_softmax(teacher_log_probs[..., :topk].float(), dim=-1)
++        baseline = (student_log_probs.exp() * (student_log_probs - teacher_support_log_probs)).sum(-1)
++        teacher_sample_logps = teacher_log_probs[..., -1].float()
++    else:
++        if teacher_log_probs.shape[-1] != student_logits.shape[-1]:
++            raise ValueError("vOPD full vocabulary requires identical teacher and student vocabulary sizes.")
++        labels = data["input_ids"].values().roll(-1).unsqueeze(0)
++        if get_ulysses_sequence_parallel_world_size() > 1:
++            labels = slice_input_tensor(labels, dim=1)
++        teacher_sample_logps = teacher_log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1).float()
++        baseline = student_logits.new_empty(student_logits.shape[:2], dtype=torch.float32)
++        for start in range(0, student_logits.shape[1], chunk_size):
++            end = start + chunk_size
++            student_log_probs = F.log_softmax(student_logits[:, start:end].float(), dim=-1)
++            # Full teacher scores already carry the full-vocabulary normalizer.
++            teacher_chunk = teacher_log_probs[:, start:end].float()
++            baseline[:, start:end] = (student_log_probs.exp() * (student_log_probs - teacher_chunk)).sum(-1)
++    return {"vopd_baseline": baseline, "vopd_teacher_sample_logps": teacher_sample_logps}
+diff --git a/verl/trainer/distillation/losses.py b/verl/trainer/distillation/losses.py
+index b939c58..da285e5 100644
+--- a/verl/trainer/distillation/losses.py
++++ b/verl/trainer/distillation/losses.py
+@@ -139,8 +139,17 @@ def compute_topk_loss(
+         case "fsdp" | "veomni" | "fsdp2":
+             import verl.trainer.distillation.fsdp.losses as fsdp_losses
+ 
++            if distillation_config.distillation_loss.loss_mode in {"vopd_topk", "vopd_full"}:
++                if config.strategy not in {"fsdp", "fsdp2"}:
++                    raise NotImplementedError("vOPD currently requires the FSDP/FSDP2 actor engine.")
++                outputs = fsdp_losses.compute_vopd_baseline(student_logits, data, distillation_config)
++                for value in outputs.values():
++                    assert value.shape == student_logits.shape[:2]
++                return outputs
+             distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
+         case "megatron":
++            if distillation_config.distillation_loss.loss_mode in {"vopd_topk", "vopd_full"}:
++                raise NotImplementedError("vOPD currently requires the FSDP actor engine.")
+             import verl.trainer.distillation.megatron.losses as megatron_losses
+ 
+             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
+@@ -403,3 +412,28 @@ def compute_distillation_loss_reverse_kl_estimator(
+         "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
+     }
+     return distillation_losses, metrics
++
++
++@register_distillation_loss(DistillationLossSettings(names=["vopd_topk", "vopd_full"], use_topk=True))
++def compute_vopd_loss(
++    config: ActorConfig,
++    distillation_config: DistillationConfig,
++    model_output: dict,
++    data: TensorDict,
++) -> tuple[torch.Tensor, dict[str, Any]]:
++    """Return the negative vOPD advantage for the existing policy-gradient reduction.
++
++    The sampled log-probabilities retain their full-vocabulary normalization.
++    Only the action-independent KL baseline is renormalized over a top-k support.
++    """
++    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
++    teacher_log_probs = no_padding_2_padding(model_output["vopd_teacher_sample_logps"], data)
++    baseline = no_padding_2_padding(model_output["vopd_baseline"], data)
++    mask = data["response_mask"]
++    if mask.is_nested:
++        mask = mask.to_padded_tensor(False)
++    losses = student_log_probs - teacher_log_probs.detach() - baseline.detach()
++    metrics = {
++        "distillation/vopd_baseline": Metric(AggregationType.MEAN, (baseline * mask).sum() / mask.sum().clamp_min(1))
++    }
++    return losses, metrics
+diff --git a/verl/utils/config.py b/verl/utils/config.py
+index 03ee621..532817e 100644
+--- a/verl/utils/config.py
++++ b/verl/utils/config.py
+@@ -117,6 +117,34 @@ def _validate_score_centering_config(config: DictConfig) -> None:
+         raise ValueError("score centering cannot be combined with distillation.")
+ 
+ 
++def _validate_vopd_config(config: DictConfig) -> None:
++    distillation = config.get("distillation") or {}
++    loss = distillation.get("distillation_loss") or {}
++    if not distillation.get("enabled", False) or loss.get("loss_mode") not in {"vopd_topk", "vopd_full"}:
++        return
++    actor = config.actor_rollout_ref.actor
++    rollout = config.actor_rollout_ref.rollout
++    if actor.strategy not in {"fsdp", "fsdp2"}:
++        raise ValueError("vOPD currently supports the FSDP/FSDP2 actor engine only.")
++    if config.actor_rollout_ref.model.get("use_fused_kernels", False) or actor.get("use_fused_kernels", False):
++        raise ValueError("vOPD requires use_fused_kernels=False to compute its detached baseline from logits.")
++    if actor.get("pad_to_length", False) or actor.get("fsdp_config", {}).get("pad_to_length", False):
++        raise ValueError("vOPD does not support pad_to_length.")
++    if not rollout.do_sample or rollout.temperature != 1.0 or rollout.top_p != 1.0 or rollout.top_k != -1:
++        raise ValueError("vOPD currently requires rollout do_sample=True, temperature=1, top_p=1, top_k=-1.")
++    if rollout.get("repetition_penalty", 1.0) != 1.0:
++        raise ValueError("vOPD requires repetition_penalty=1.")
++    if rollout.agent.default_agent_loop != "single_turn_agent" or rollout.multi_turn.enable:
++        raise ValueError("vOPD currently supports single-turn rollouts only.")
++    if loss.loss_mode == "vopd_topk":
++        if rollout.name != "vllm" or rollout.get("topk_log_probs", 0) != loss.topk:
++            raise ValueError("vopd_topk requires vLLM rollout.topk_log_probs equal to distillation_loss.topk.")
++        if not rollout.calculate_log_probs or rollout.logprobs_mode != "processed_logprobs":
++            raise ValueError(
++                "vopd_topk requires calculate_log_probs=True and rollout.logprobs_mode=processed_logprobs."
++            )
++
++
+ def validate_config(
+     config: DictConfig,
+     use_reference_policy: bool,
+@@ -197,6 +225,7 @@ def validate_config(
+     actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
+     _validate_router_replay_config(actor_config, config.algorithm.get("rollout_correction", None))
+     _validate_score_centering_config(config)
++    _validate_vopd_config(config)
+ 
+     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
+         if use_reference_policy:
+diff --git a/verl/workers/config/distillation.py b/verl/workers/config/distillation.py
+index b58f8bc..34bf41f 100644
+--- a/verl/workers/config/distillation.py
++++ b/verl/workers/config/distillation.py
+@@ -103,6 +103,14 @@ class DistillationLossConfig(BaseConfig):
+ 
+         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
+ 
++        if self.loss_mode in {"vopd_topk", "vopd_full"}:
++            if not self.use_policy_gradient:
++                raise ValueError("vOPD requires use_policy_gradient=True.")
++            if self.loss_max_clamp is not None or self.log_prob_min_clamp is not None:
++                raise ValueError("vOPD requires loss_max_clamp=null and log_prob_min_clamp=null.")
++            if self.loss_mode == "vopd_topk" and (self.topk is None or not 1 <= self.topk <= 127):
++                raise ValueError("vOPD topk must be in [1, 127] for vLLM selective scoring (k+1 <= 128).")
++
+         if self.policy_loss_mode != "vanilla":
+             raise NotImplementedError(
+                 f"Only vanilla policy loss is currently supported when use_policy_gradient is True, "
+@@ -271,10 +279,19 @@ class DistillationConfig(BaseConfig):
+             return
+ 
+         self.teacher_models = self._resolve_teacher_models()
++        vopd_full = self.distillation_loss.loss_mode == "vopd_full"
++        vopd_topk = self.distillation_loss.loss_mode == "vopd_topk"
+         teacher_world_size_sum = 0
+         for teacher_model in self.teacher_models.values():
++            if vopd_full or vopd_topk:
++                if teacher_model.inference.name != "vllm":
++                    raise ValueError("vOPD teacher scoring currently requires vLLM.")
++                if teacher_model.inference.logprobs_mode != "raw_logprobs":
++                    raise ValueError("vOPD requires teacher inference.logprobs_mode=raw_logprobs.")
++                if vopd_full:
++                    teacher_model.inference.engine_kwargs.setdefault("vllm", {})["max_logprobs"] = -1
+             teacher_model.validate_and_prepare_for_distillation(
+-                use_topk=self.distillation_loss.loss_settings.use_topk,
++                use_topk=self.distillation_loss.loss_settings.use_topk and not vopd_full,
+                 topk=self.distillation_loss.topk,
+             )
+             teacher_world_size_sum += teacher_model.world_size
+diff --git a/verl/workers/rollout/utils.py b/verl/workers/rollout/utils.py
+index 40056ec..37d0f88 100644
+--- a/verl/workers/rollout/utils.py
++++ b/verl/workers/rollout/utils.py
+@@ -265,3 +265,62 @@ def update_prometheus_config(config: PrometheusConfig, server_addresses: list[st
+ 
+     except Exception as e:
+         logger.error(f"Failed to update Prometheus configuration: {e}")
++
++
++def extract_prompt_logprobs(output, num_prompt_logprobs: int | None, result_dict: dict[str, list]):
++    """Extract prompt log probabilities from generation output."""
++    if num_prompt_logprobs is None:
++        return
++
++    prompt_logprobs_ls, prompt_ids_ls = [], []
++    full_vocab_size = None
++    # NOTE: logprob of first prompt token is None.
++    for logprobs_dict in output.prompt_logprobs[1:]:
++        if num_prompt_logprobs == -1:
++            vocab_size = len(logprobs_dict)
++            if not all(token in logprobs_dict for token in range(vocab_size)):
++                raise ValueError("Full-vocabulary prompt logprobs must cover contiguous vocabulary IDs.")
++            if full_vocab_size is not None and vocab_size != full_vocab_size:
++                raise ValueError("Full-vocabulary prompt logprobs changed vocabulary size across positions.")
++            if full_vocab_size is None:
++                full_vocab_size = vocab_size
++                token_ids = list(range(vocab_size))
++            prompt_ids_ls.append(token_ids)
++            prompt_logprobs_ls.append([logprobs_dict[token].logprob for token in token_ids])
++        elif num_prompt_logprobs == 0:
++            token_id_str = list(logprobs_dict.keys())[0]
++            logprob = logprobs_dict[token_id_str].logprob
++            prompt_logprobs_ls.append([logprob])
++            prompt_ids_ls.append([int(token_id_str)])
++        else:
++            prompt_ids = [None] * num_prompt_logprobs
++            prompt_logprobs = [None] * num_prompt_logprobs
++            # We get either top-k logprobs or top-k plus the sampled logprob (if sampled token is not in top-k)
++            assert len(logprobs_dict) in [num_prompt_logprobs, num_prompt_logprobs + 1], len(logprobs_dict)
++            for token_id_str, token_logprob in logprobs_dict.items():
++                rank = token_logprob.rank
++                if rank > num_prompt_logprobs:
++                    continue  # the sampled token is not in the top-k
++                logprob = token_logprob.logprob
++                prompt_ids[rank - 1] = int(token_id_str)
++                prompt_logprobs[rank - 1] = logprob
++            prompt_logprobs_ls.append(prompt_logprobs)
++            prompt_ids_ls.append(prompt_ids)
++
++    # NOTE: pad a dummy prompt logprob for last prompt token.
++    if num_prompt_logprobs == -1:
++        if full_vocab_size is None:
++            raise ValueError("Full-vocabulary scoring requires at least two prompt tokens.")
++        prompt_logprobs_ls.append([0.0] * full_vocab_size)
++        prompt_ids_ls.append(list(range(full_vocab_size)))
++    else:
++        prompt_logprobs_ls.append([0.0] * max(num_prompt_logprobs, 1))
++        prompt_ids_ls.append([0] * max(num_prompt_logprobs, 1))
++
++    result_dict["prompt_ids"] = prompt_ids_ls
++    result_dict["prompt_logprobs"] = prompt_logprobs_ls
++
++
++def extract_requested_token_logprobs(logprobs, token_ids: list[int]) -> list[float]:
++    """Read vLLM selective scores in request order, excluding its extra sampled token."""
++    return [logprobs[token].logprob for token in token_ids]
+diff --git a/verl/workers/rollout/vllm_rollout/utils.py b/verl/workers/rollout/vllm_rollout/utils.py
+index 213b072..8cc7927 100644
+--- a/verl/workers/rollout/vllm_rollout/utils.py
++++ b/verl/workers/rollout/vllm_rollout/utils.py
+@@ -25,7 +25,6 @@ from types import MethodType
+ from typing import Any, Literal, Optional, get_args
+ 
+ import torch
+-from vllm.outputs import RequestOutput
+ 
+ from verl.utils.device import get_device_name, is_npu_available
+ from verl.utils.vllm import TensorLoRARequest, VLLMHijack, resolve_weight_name
+@@ -39,6 +38,7 @@ from verl.utils.vllm.vllm_quant_utils import (
+     process_quanted_weights_after_loading,
+ )
+ from verl.utils.vllm.vllm_unquant_utils import fold_unquantized_moe_params, stage_unquantized_moe_params
++from verl.workers.rollout.utils import extract_prompt_logprobs  # noqa: F401
+ from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+ from verl.workers.rollout.vllm_rollout.weight_update_utils import (
+     apply_buffer_updates,
+@@ -549,39 +549,3 @@ def build_mtp_speculative_config(
+         "num_speculative_tokens": num_speculative_tokens,
+         **{key: val for key, val in engine_speculative_config.items() if val is not None},
+     }
+-
+-
+-def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional[int], result_dict: dict[str, list]):
+-    """Extract prompt log probabilities from generation output."""
+-    if num_prompt_logprobs is None:
+-        return
+-
+-    prompt_logprobs_ls, prompt_ids_ls = [], []
+-    # NOTE: logprob of first prompt token is None.
+-    for logprobs_dict in output.prompt_logprobs[1:]:
+-        if num_prompt_logprobs == 0:
+-            token_id_str = list(logprobs_dict.keys())[0]
+-            logprob = logprobs_dict[token_id_str].logprob
+-            prompt_logprobs_ls.append([logprob])
+-            prompt_ids_ls.append([int(token_id_str)])
+-        else:
+-            prompt_ids = [None] * num_prompt_logprobs
+-            prompt_logprobs = [None] * num_prompt_logprobs
+-            # We get either top-k logprobs or top-k plus the sampled logprob (if sampled token is not in top-k)
+-            assert len(logprobs_dict) in [num_prompt_logprobs, num_prompt_logprobs + 1], len(logprobs_dict)
+-            for token_id_str, token_logprob in logprobs_dict.items():
+-                rank = token_logprob.rank
+-                if rank > num_prompt_logprobs:
+-                    continue  # the sampled token is not in the top-k
+-                logprob = token_logprob.logprob
+-                prompt_ids[rank - 1] = int(token_id_str)
+-                prompt_logprobs[rank - 1] = logprob
+-            prompt_logprobs_ls.append(prompt_logprobs)
+-            prompt_ids_ls.append(prompt_ids)
+-
+-    # NOTE: pad a dummy prompt logprob for last prompt token.
+-    prompt_logprobs_ls.append([0.0] * max(num_prompt_logprobs, 1))
+-    prompt_ids_ls.append([0] * max(num_prompt_logprobs, 1))
+-
+-    result_dict["prompt_ids"] = prompt_ids_ls
+-    result_dict["prompt_logprobs"] = prompt_logprobs_ls
+diff --git a/verl/workers/rollout/vllm_rollout/vllm_async_server.py b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+index 6ad8658..2b0a963 100644
+--- a/verl/workers/rollout/vllm_rollout/vllm_async_server.py
++++ b/verl/workers/rollout/vllm_rollout/vllm_async_server.py
+@@ -56,6 +56,7 @@ from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
+ from verl.workers.config import HFModelConfig, RolloutConfig
+ from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
+ from verl.workers.rollout.utils import (
++    extract_requested_token_logprobs,
+     extract_response_topk_logprobs,
+     get_max_position_embeddings,
+     get_vision_placeholder_token_ids,
+@@ -725,6 +726,12 @@ class vLLMHttpServer:
+             num_prompt_logprobs=sampling_params.prompt_logprobs,
+             result_dict=extra_fields,
+         )
++        if sampling_params.logprob_token_ids is not None:
++            # Selective teacher scoring: preserve request order, ignoring the extra sampled token.
++            requested_logprobs = final_res.outputs[0].logprobs[0]
++            extra_fields["requested_token_logprobs"] = extract_requested_token_logprobs(
++                requested_logprobs, sampling_params.logprob_token_ids
++            )
+         token_ids = final_res.outputs[0].token_ids
+         log_probs = None
+         if sampling_params.logprobs:

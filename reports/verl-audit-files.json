@@ -1,0 +1,18 @@
+[
+  "docs/algo/opd.md",
+  "examples/on_policy_distillation_trainer/README.md",
+  "tests/special_sanity/check_license.py",
+  "tests/workers/test_distillation_topk_symmetry_on_cpu.py",
+  "verl/experimental/agent_loop/agent_loop.py",
+  "verl/experimental/teacher_loop/teacher_manager.py",
+  "verl/trainer/config/distillation/distillation.yaml",
+  "verl/trainer/distillation/fsdp/losses.py",
+  "verl/trainer/distillation/losses.py",
+  "verl/utils/config.py",
+  "verl/workers/config/distillation.py",
+  "verl/workers/rollout/utils.py",
+  "verl/workers/rollout/vllm_rollout/utils.py",
+  "verl/workers/rollout/vllm_rollout/vllm_async_server.py",
+  "examples/on_policy_distillation_trainer/run_vopd_fsdp.sh",
+  "tests/trainer/distillation/test_vopd_on_cpu.py"
+]

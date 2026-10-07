@@ -1,0 +1,54 @@
+{
+  "project_under_data": {
+    "evidence": "/data/minjaeoh/vopd-upstream",
+    "verified": true
+  },
+  "paper_and_reference": {
+    "evidence": [
+      "paper/vopd.pdf",
+      "paper/vopd.txt",
+      "repos/vOPD/src/opd_trainer.py"
+    ],
+    "verified": true
+  },
+  "latest_upstream_clones": {
+    "evidence": "reports/upstream-heads.json",
+    "verified": true
+  },
+  "trl_implementation": {
+    "evidence": [
+      "repos/trl/trl/trainer/distillation_trainer.py",
+      "repos/trl/trl/trainer/distillation_config.py",
+      "reports/trl-regression.log"
+    ],
+    "verified": true
+  },
+  "verl_implementation": {
+    "evidence": [
+      "repos/verl/verl/trainer/distillation/fsdp/losses.py",
+      "repos/verl/verl/experimental/teacher_loop/teacher_manager.py",
+      "reports/verl-regression.log"
+    ],
+    "verified": true
+  },
+  "code_map_and_usage": {
+    "evidence": "README.md",
+    "verified": true
+  },
+  "upstream_plan": {
+    "evidence": [
+      "UPSTREAM_PLAN.md",
+      "reports/upstream-search.json"
+    ],
+    "verified": true
+  },
+  "topk_and_full_v_feasibility": {
+    "evidence": [
+      "README.md",
+      "repos/verl/docs/algo/opd.md",
+      "reports/sampling_params.py.vllm029"
+    ],
+    "verified": true,
+    "limits": "Full V is implemented as opt-in O(TV) transport. Top-k uses exact selected-output prefix requests on student rollout support. Live distributed GPU behavior and throughput remain unverified."
+  }
+}

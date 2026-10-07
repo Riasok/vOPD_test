@@ -1,0 +1,22 @@
+# Credentials and local environments
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+.git-credentials
+*.pem
+*.key
+# Download/build/runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.hf-cache/
+.uv-cache/
+.pip-cache/
+.pre-commit-cache/
+.tmp/
+outputs/
+checkpoints/
+wandb/
