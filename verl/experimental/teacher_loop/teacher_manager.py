@@ -50,8 +50,6 @@ def _get_teacher_sampling_params(
             teacher_model_config.inference.temperature,
         )
     num_logprobs = distillation_loss_config.topk if distillation_loss_config.loss_settings.use_topk else 0
-    if distillation_loss_config.loss_mode == "vopd_full":
-        num_logprobs = -1
     return {
         "max_tokens": 1,
         "temperature": 1.0,
@@ -163,25 +161,22 @@ class AsyncTeacherLLMServerManager:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Score each student support with a one-token vLLM request on its prefix.
 
-        vLLM 0.29 supports selected output logprobs, but not per-position selected
-        prompt logprobs. Prefix requests bound score transfer to O(T*k), at the
-        cost of T prefills. Prefix caching on the teacher can amortize those prefills.
+        vLLM supports selected output scores, so this uses T prefills and O(T*k) scores.
         """
         k = self.distillation_loss_config.topk
         if prompt_length is None or not 1 <= prompt_length <= len(sequence_ids) or student_topk_ids is None:
             raise ValueError("vOPD top-k requires the student rollout's response_topk_ids and prompt length.")
         response_length = len(sequence_ids) - prompt_length
+        # Dummy prompt/last rows are masked out. Give them a valid distinct support.
+        ids = torch.cat([torch.arange(k), torch.zeros(1, dtype=torch.long)]).repeat(len(sequence_ids), 1)
+        scores = torch.zeros(len(sequence_ids), k + 1)
         if response_length == 0:
-            ids = torch.cat([torch.arange(k), torch.zeros(1, dtype=torch.long)]).repeat(len(sequence_ids), 1)
-            return ids.to(torch.int32), torch.zeros(len(sequence_ids), k + 1)
+            return ids.to(torch.int32), scores
         support = torch.as_tensor(student_topk_ids, dtype=torch.long)
         if support.shape != (response_length, k):
             raise ValueError(f"Expected student top-k shape {(response_length, k)}, got {tuple(support.shape)}.")
         if (support.sort(-1).values.diff(dim=-1) == 0).any():
             raise ValueError("Student top-k support must contain k distinct tokens at each position.")
-        # Dummy prompt/last rows are masked out. Give them a valid distinct support.
-        ids = torch.cat([torch.arange(k), torch.zeros(1, dtype=torch.long)]).repeat(len(sequence_ids), 1)
-        scores = torch.zeros(len(sequence_ids), k + 1)
 
         async def score_position(index):
             position = prompt_length + index

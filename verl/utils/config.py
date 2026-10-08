@@ -120,7 +120,7 @@ def _validate_score_centering_config(config: DictConfig) -> None:
 def _validate_vopd_config(config: DictConfig) -> None:
     distillation = config.get("distillation") or {}
     loss = distillation.get("distillation_loss") or {}
-    if not distillation.get("enabled", False) or loss.get("loss_mode") not in {"vopd_topk", "vopd_full"}:
+    if not distillation.get("enabled", False) or loss.get("loss_mode") != "vopd_topk":
         return
     actor = config.actor_rollout_ref.actor
     rollout = config.actor_rollout_ref.rollout
@@ -136,13 +136,10 @@ def _validate_vopd_config(config: DictConfig) -> None:
         raise ValueError("vOPD requires repetition_penalty=1.")
     if rollout.agent.default_agent_loop != "single_turn_agent" or rollout.multi_turn.enable:
         raise ValueError("vOPD currently supports single-turn rollouts only.")
-    if loss.loss_mode == "vopd_topk":
-        if rollout.name != "vllm" or rollout.get("topk_log_probs", 0) != loss.topk:
-            raise ValueError("vopd_topk requires vLLM rollout.topk_log_probs equal to distillation_loss.topk.")
-        if not rollout.calculate_log_probs or rollout.logprobs_mode != "processed_logprobs":
-            raise ValueError(
-                "vopd_topk requires calculate_log_probs=True and rollout.logprobs_mode=processed_logprobs."
-            )
+    if rollout.name != "vllm" or rollout.get("topk_log_probs", 0) != loss.topk:
+        raise ValueError("vopd_topk requires vLLM rollout.topk_log_probs equal to distillation_loss.topk.")
+    if not rollout.calculate_log_probs or rollout.logprobs_mode != "processed_logprobs":
+        raise ValueError("vopd_topk requires calculate_log_probs=True and rollout.logprobs_mode=processed_logprobs.")
 
 
 def validate_config(

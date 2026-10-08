@@ -1059,7 +1059,7 @@ class AgentLoopWorker:
     ) -> None:
         """Compute teacher logprobs for single sample."""
         if self.distillation_enabled and not validate:
-            if self.teacher_server_manager.distillation_loss_config.loss_mode in {"vopd_topk", "vopd_full"}:
+            if self.teacher_server_manager.distillation_loss_config.loss_mode == "vopd_topk":
                 if output.num_turns > 2:
                     raise ValueError("vOPD currently supports single-turn rollouts only.")
                 if output.multi_modal_data:

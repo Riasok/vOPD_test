@@ -20,8 +20,7 @@ distillation_loss:
   _target_: verl.workers.config.DistillationLossConfig
 
 
-  # Loss function mode for distillation. vopd_topk/vopd_full require
-  # use_policy_gradient=true and both clamps=null; see docs/algo/opd.md.
+  # Loss function mode for distillation
   loss_mode: k3
 
   # If distillation loss requires top-k logits, this is the value of k
