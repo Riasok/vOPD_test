@@ -1652,17 +1652,9 @@ training_args = GKDConfig(
 
 **📜 Paper**: https://huggingface.co/papers/2605.07865
 
-vOPD subtracts a detached negative reverse-KL baseline from the sampled-token distillation reward. Its top-k
-variant renormalizes both distributions on the student's support to approximate only the baseline, preserving the
-expected conditional token gradient under on-policy sampling. Use [`DistillationTrainer`] with:
-
-```python
-from trl import DistillationConfig
-
-training_args = DistillationConfig(loss_type="vopd", vopd_top_k=100)  # 0 for full vocabulary
-```
-
-See [vOPD training](distillation_trainer#vopd-a-detached-control-variate-baseline) for the estimator and constraints.
+[`DistillationTrainer`] implements vOPD with `DistillationConfig(loss_type="vopd", vopd_top_k=100)`.
+Use `vopd_top_k=0` for the full-vocabulary baseline.
+See [vOPD training](distillation_trainer#vopd-a-detached-control-variate-baseline).
 
 ### MOPD: Multi-Teacher On-Policy Distillation for Capability Integration in LLM Post-Training
 

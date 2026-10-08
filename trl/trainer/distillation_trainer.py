@@ -157,13 +157,11 @@ def _chunk(
         student_sample_logps = selective_log_softmax(student_logits, completion_ids)
         with torch.no_grad():
             teacher_sample_logps = selective_log_softmax(teacher_logits, completion_ids)
+            baseline_student, baseline_teacher = student_logits, teacher_logits
             if vopd_top_k > 0:
                 support = student_logits.topk(min(vopd_top_k, student_logits.size(-1)), dim=-1).indices
                 baseline_student = student_logits.gather(-1, support)
                 baseline_teacher = teacher_logits.gather(-1, support)
-            else:
-                baseline_student = student_logits
-                baseline_teacher = teacher_logits
             log_p = F.log_softmax(baseline_student, dim=-1)
             log_q = F.log_softmax(baseline_teacher, dim=-1)
             baseline = (log_p.exp() * (log_p - log_q)).sum(-1)
@@ -259,7 +257,6 @@ def _chunked_divergence_loss(
             If set, applies `softcap * tanh(logits / softcap)` to the teacher's logits, after the scale.
         temperature (`float`, *optional*, defaults to `1.0`):
             Softmax temperature applied to both distributions before the divergence, after any scale/softcapping.
-
         completion_ids (`torch.Tensor`, *optional*):
             Sampled completion token IDs of shape `(B, K)`, required for vOPD.
         loss_type (`str`, *optional*, defaults to `"jsd"`):
@@ -289,9 +286,6 @@ def _chunked_divergence_loss(
 
     # Each model flattens with its own hidden width: the teacher may be wider/narrower than the student (only the
     # vocabulary must match), and each projects through its own `lm_head`.
-    if loss_type == "vopd" and (completion_ids is None or completion_ids.shape != completion_mask.shape):
-        raise ValueError("vOPD requires completion_ids with the same shape as completion_mask.")
-
     h_s = student_hidden_states.reshape(-1, student_hidden_states.size(-1))
     h_t = teacher_hidden_states.reshape(-1, teacher_hidden_states.size(-1))
     valid = completion_mask.reshape(-1) != 0
@@ -824,8 +818,6 @@ class DistillationTrainer(_BaseTrainer):
             disable_dropout_in_model(self.model)
 
         # Store config values
-        self.loss_type = args.loss_type
-        self.vopd_top_k = args.vopd_top_k
         self.beta = args.beta
         self.temperature = args.temperature
         self.top_p = args.top_p
@@ -1999,9 +1991,9 @@ class DistillationTrainer(_BaseTrainer):
             student_final_logit_softcapping=getattr(student_config, "final_logit_softcapping", None),
             teacher_final_logit_softcapping=getattr(teacher_config, "final_logit_softcapping", None),
             temperature=self.temperature,
-            completion_ids=inputs["completion_ids"],
-            loss_type=self.loss_type,
-            vopd_top_k=self.vopd_top_k,
+            completion_ids=inputs["completion_ids"] if self.args.loss_type == "vopd" else None,
+            loss_type=self.args.loss_type,
+            vopd_top_k=self.args.vopd_top_k,
         )
         # Return the raw entropy sum and valid-token count for `compute_loss` to aggregate and log after the forward
         # returns (see there). Detached: the metric is gradient-free.
