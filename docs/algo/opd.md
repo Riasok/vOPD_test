@@ -2,7 +2,7 @@
 
 **Author:** [Jacob Helwig](https://jacobhelwig.github.io/)
 
-Last updated: 05/26/2026.
+Last updated: 10/08/2026.
 
 ## Background
 
@@ -777,3 +777,35 @@ The returned scalar loss is what `engine.train_batch` backpropagates.
 - `tests/workers/test_distillation_topk_symmetry_on_cpu.py` — top-k loss symmetry and overlap metric checks
 - `tests/utils/test_special_megatron_kl_loss_tp.py` — Megatron KL loss and overlap metrics under tensor parallelism
 - `tests/special_e2e/run_v1_separate_async_opd.sh` — end-to-end multi-teacher OPD on the V1 separate_async trainer
+
+
+## vOPD: distillation with a control variate baseline
+
+[vOPD](https://arxiv.org/abs/2605.07865) adds a detached reverse-KL baseline to the
+sampled-token reward: `A = stop_gradient(log teacher(a) - log student(a) + KL)`.
+`vopd_topk` computes KL after renormalizing both distributions on the student's
+rollout top-k. The sampled token is scored separately with full-vocabulary
+normalization and never changes the baseline support. The existing PPO reduction
+consumes this advantage; policy reuse retains the rollout-time support.
+
+Use the existing recipe after preparing its datasets (model/data/GPU overrides
+work as usual):
+
+```bash
+DISTILLATION_LOSS_MODE=vopd_topk DISTILLATION_TOPK=20 \
+bash examples/on_policy_distillation_trainer/run_qwen3_8b_fsdp.sh \
+    actor_rollout_ref.rollout.topk_log_probs=20 \
+    +distillation.teacher_models.teacher_model.inference.logprobs_mode=raw_logprobs \
+    distillation.distillation_loss.loss_max_clamp=null \
+    distillation.distillation_loss.log_prob_min_clamp=null
+```
+
+Supported: FSDP/FSDP2, vLLM student/teacher, the same tokenizer/vocabulary mapping,
+text-only single-turn rollouts, temperature 1, and untruncated sampling.
+Policy gradient is required; fused kernels and `pad_to_length` are rejected.
+The recipe's existing defaults satisfy these constraints and disable task rewards.
+
+The teacher scores k support IDs plus the sampled ID on each response prefix:
+O(Tk) score transfer but T prefills, with at most eight requests in flight per
+manager. vLLM limits k to 1–127. Live vLLM/GPU training and throughput remain
+unvalidated; start with short responses. Only top-k vOPD is implemented here.

@@ -725,6 +725,12 @@ class vLLMHttpServer:
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
         )
+        if sampling_params.logprob_token_ids is not None:
+            # Selective teacher scoring: preserve request order, ignoring the extra sampled token.
+            requested_logprobs = final_res.outputs[0].logprobs[0]
+            extra_fields["requested_token_logprobs"] = [
+                requested_logprobs[token].logprob for token in sampling_params.logprob_token_ids
+            ]
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs:

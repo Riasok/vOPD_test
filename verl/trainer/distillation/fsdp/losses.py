@@ -15,6 +15,7 @@
 
 import torch
 import torch.nn.functional as F
+from tensordict import TensorDict
 
 from verl.utils.ulysses import (
     get_ulysses_sequence_parallel_world_size,
@@ -147,3 +148,22 @@ def compute_forward_kl_topk(
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
     }
+
+
+@torch.no_grad()
+def compute_vopd_baseline(
+    student_logits: torch.Tensor, data: TensorDict, config: DistillationConfig
+) -> dict[str, torch.Tensor]:
+    """Compute KL on the student's rollout top-k; keep the sampled-token score separate."""
+    topk = config.distillation_loss.topk
+    teacher_log_probs = data["teacher_logprobs"].values().unsqueeze(0)
+    support_ids = data["teacher_ids"].values()[..., :topk].unsqueeze(0).long()
+    if get_ulysses_sequence_parallel_world_size() > 1:
+        teacher_log_probs = slice_input_tensor(teacher_log_probs, dim=1)
+        support_ids = slice_input_tensor(support_ids, dim=1)
+    if teacher_log_probs.shape != (*student_logits.shape[:2], topk + 1):
+        raise ValueError("vOPD requires k support scores plus a sampled-token score at each prediction position.")
+    student_log_probs = F.log_softmax(student_logits.gather(-1, support_ids).float(), dim=-1)
+    teacher_support_log_probs = F.log_softmax(teacher_log_probs[..., :topk].float(), dim=-1)
+    baseline = kl_divergence(log_q=teacher_support_log_probs, log_p=student_log_probs)
+    return {"vopd_baseline": baseline, "vopd_teacher_sample_logps": teacher_log_probs[..., -1].float().detach()}

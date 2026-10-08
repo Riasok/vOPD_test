@@ -134,6 +134,13 @@ def compute_topk_loss(
     - student_mass: (bsz, seqlen/cp_size)
     - teacher_mass: (bsz, seqlen/cp_size)
     """
+    if distillation_config.distillation_loss.loss_mode == "vopd_topk":
+        if config.strategy not in {"fsdp", "fsdp2"}:
+            raise NotImplementedError("vOPD currently requires the FSDP/FSDP2 actor engine.")
+        from verl.trainer.distillation.fsdp.losses import compute_vopd_baseline
+
+        return compute_vopd_baseline(student_logits, data, distillation_config)
+
     match config.strategy:
         # VeOmni uses FSDP2 internally, so its loss computation is identical to FSDP.
         case "fsdp" | "veomni" | "fsdp2":
@@ -403,3 +410,17 @@ def compute_distillation_loss_reverse_kl_estimator(
         "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
     }
     return distillation_losses, metrics
+
+
+@register_distillation_loss(DistillationLossSettings(names=["vopd_topk"], use_topk=True))
+def compute_vopd_loss(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Return negative vOPD advantage; the existing policy-gradient loss detaches it."""
+    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
+    teacher_log_probs = no_padding_2_padding(model_output["vopd_teacher_sample_logps"], data)
+    baseline = no_padding_2_padding(model_output["vopd_baseline"], data)
+    return student_log_probs - teacher_log_probs - baseline, {}
