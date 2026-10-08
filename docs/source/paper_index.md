@@ -1648,6 +1648,14 @@ training_args = GKDConfig(
 )
 ```
 
+### KL for a KL: On-Policy Distillation with Control Variate Baseline
+
+**📜 Paper**: https://huggingface.co/papers/2605.07865
+
+[`DistillationTrainer`] implements vOPD with `DistillationConfig(loss_type="vopd", vopd_top_k=100)`.
+Use `vopd_top_k=0` for the full-vocabulary baseline.
+See [vOPD training](distillation_trainer#vopd-a-detached-control-variate-baseline).
+
 ### MOPD: Multi-Teacher On-Policy Distillation for Capability Integration in LLM Post-Training
 
 **📜 Paper**: https://huggingface.co/papers/2606.30406

@@ -85,6 +85,9 @@ class ServerDistillationConfig(DistillationConfig):
     def __post_init__(self):
         super().__post_init__()
 
+        if self.loss_type == "vopd":
+            raise ValueError("vOPD requires a local teacher; ServerDistillationTrainer does not support it.")
+
         if self.reverse_kl_top_1_mode not in {"sampled", "argmax"}:
             raise ValueError("reverse_kl_top_1_mode must be one of: 'sampled', 'argmax'")
         if self.use_liger_kernel:

@@ -74,6 +74,7 @@ from .utils import (
     pad,
     print_prompt_completions_sample,
     repeat_iterable_dataset,
+    selective_log_softmax,
     shuffle_sequence_dict,
     split_pixel_values_by_grid,
     split_tensor_dict,
@@ -102,7 +103,24 @@ logger = get_logger(__name__)
 _CHUNKED_LM_HEAD_CHUNK_SIZE = 256
 
 
-def _chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t, w_t, b_t, t_scale, t_softcap, beta, temperature, valid):
+def _chunk(
+    h_s,
+    w_s,
+    b_s,
+    s_scale,
+    s_softcap,
+    h_t,
+    w_t,
+    b_t,
+    t_scale,
+    t_softcap,
+    beta,
+    temperature,
+    valid,
+    completion_ids=None,
+    loss_type="jsd",
+    vopd_top_k=0,
+):
     # Project both hidden states to vocab logits inside the checkpointed body so only `(chunk, H)` is retained across
     # the backward, never `(chunk, V)`. ZeRO-3 shards the `lm_head`, so gather it tightly around each projection.
     # `logit_scale` (Cohere) / `final_logit_softcapping` (Gemma) are applied per model to match its full forward.
@@ -133,6 +151,25 @@ def _chunk(h_s, w_s, b_s, s_scale, s_softcap, h_t, w_t, b_t, t_scale, t_softcap,
     if temperature != 1.0:
         student_logits = student_logits / temperature
         teacher_logits = teacher_logits / temperature
+
+    if loss_type == "vopd":
+        # The sampled token keeps its full-distribution probability even when the baseline uses top-k.
+        student_sample_logps = selective_log_softmax(student_logits, completion_ids)
+        with torch.no_grad():
+            teacher_sample_logps = selective_log_softmax(teacher_logits, completion_ids)
+            baseline_student, baseline_teacher = student_logits, teacher_logits
+            if vopd_top_k > 0:
+                support = student_logits.topk(min(vopd_top_k, student_logits.size(-1)), dim=-1).indices
+                baseline_student = student_logits.gather(-1, support)
+                baseline_teacher = teacher_logits.gather(-1, support)
+            log_p = F.log_softmax(baseline_student, dim=-1)
+            log_q = F.log_softmax(baseline_teacher, dim=-1)
+            baseline = (log_p.exp() * (log_p - log_q)).sum(-1)
+            advantage = teacher_sample_logps - student_sample_logps + baseline
+            # Entropy is a metric, not part of the vOPD gradient.
+            full_log_p = log_p if vopd_top_k == 0 else F.log_softmax(student_logits, dim=-1)
+            entropy = -(full_log_p.exp() * full_log_p).sum(-1)
+        return -(advantage * student_sample_logps * valid).sum(), (entropy * valid).sum()
 
     student_log_probs = F.log_softmax(student_logits, dim=-1)
     teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
@@ -174,9 +211,12 @@ def _chunked_divergence_loss(
     student_final_logit_softcapping: float | None = None,
     teacher_final_logit_softcapping: float | None = None,
     temperature: float = 1.0,
+    completion_ids: torch.Tensor | None = None,
+    loss_type: str = "jsd",
+    vopd_top_k: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Memory-efficient generalized JSD over student/teacher hidden states and their `lm_head` weights.
+    Memory-efficient generalized JSD or vOPD over student/teacher hidden states and their `lm_head` weights.
 
     The full `lm_head` projections are never materialized. Valid (unmasked) completion positions are packed to the
     front (via `argsort` on the completion mask, a static-shape op) and processed in chunks of `chunk_size`, rounding
@@ -217,6 +257,12 @@ def _chunked_divergence_loss(
             If set, applies `softcap * tanh(logits / softcap)` to the teacher's logits, after the scale.
         temperature (`float`, *optional*, defaults to `1.0`):
             Softmax temperature applied to both distributions before the divergence, after any scale/softcapping.
+        completion_ids (`torch.Tensor`, *optional*):
+            Sampled completion token IDs of shape `(B, K)`, required for vOPD.
+        loss_type (`str`, *optional*, defaults to `"jsd"`):
+            `"jsd"` for generalized JSD or `"vopd"` for the sampled policy gradient with a detached KL baseline.
+        vopd_top_k (`int`, *optional*, defaults to `0`):
+            Student support size for the baseline. `0` uses the full vocabulary.
 
     Returns:
         `tuple[torch.Tensor, torch.Tensor, torch.Tensor]`: scalar loss, sum of per-token student entropy (in nats), and
@@ -253,6 +299,8 @@ def _chunked_divergence_loss(
     h_s = h_s[order]
     h_t = h_t[order]
     valid = valid[order]
+    if completion_ids is not None:
+        completion_ids = completion_ids.reshape(-1)[order]
 
     # Process only the whole chunks covering the valid prefix: bounds XLA recompiles and drops fully-masked chunks on
     # GPU. At least one chunk always runs: under context parallelism a rank can hold only masked positions, and its
@@ -276,6 +324,9 @@ def _chunked_divergence_loss(
             beta,
             temperature,
             valid[start : start + chunk_size].float(),
+            completion_ids[start : start + chunk_size] if completion_ids is not None else None,
+            loss_type,
+            vopd_top_k,
             use_reentrant=False,
         )
         loss = loss + chunk_loss
@@ -1940,6 +1991,9 @@ class DistillationTrainer(_BaseTrainer):
             student_final_logit_softcapping=getattr(student_config, "final_logit_softcapping", None),
             teacher_final_logit_softcapping=getattr(teacher_config, "final_logit_softcapping", None),
             temperature=self.temperature,
+            completion_ids=inputs["completion_ids"] if self.args.loss_type == "vopd" else None,
+            loss_type=self.args.loss_type,
+            vopd_top_k=self.args.vopd_top_k,
         )
         # Return the raw entropy sum and valid-token count for `compute_loss` to aggregate and log after the forward
         # returns (see there). Detached: the metric is gradient-free.

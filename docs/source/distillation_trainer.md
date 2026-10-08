@@ -305,3 +305,20 @@ trl distillation \
 ## DistillationConfig
 
 [[autodoc]] DistillationConfig
+
+## vOPD: a detached control variate baseline
+
+[vOPD](https://huggingface.co/papers/2605.07865) uses the loss
+`-stop_gradient(log q(y) - log p(y) + KL(p || q)) * log p(y)` for student `p`, teacher `q`, and sampled token `y`.
+Enable it in [`DistillationConfig`] or append these options to the `trl distillation` command above:
+
+```bash
+--loss_type vopd --vopd_top_k 100
+```
+
+`vopd_top_k=0` uses the full vocabulary; a positive value renormalizes both distributions on the student's top-k
+support for the baseline only. Sampled-token log probabilities always use the full distribution. Both variants
+reuse the existing chunked projections and require a local teacher with the same tokenizer and vocabulary.
+
+Use `beta=1`, positive `temperature`, `top_p=1`, `top_k=0`, `min_p=0` or `None`, and `repetition_penalty=1`.
+Constrained generation, `generation_kwargs` overrides, and `ServerDistillationTrainer` are unsupported.
