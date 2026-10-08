@@ -305,3 +305,42 @@ trl distillation \
 ## DistillationConfig
 
 [[autodoc]] DistillationConfig
+
+
+## vOPD: a detached control variate baseline
+
+[vOPD](https://huggingface.co/papers/2605.07865) keeps a sampled-token policy gradient and centers its reward with
+an action-independent reverse-KL baseline. For student distribution `p`, teacher `q`, and sampled token `y`,
+the advantage is `stop_gradient(log q(y) - log p(y) + KL(p || q))`. The loss is `-advantage * log p(y)`.
+The baseline and teacher are detached; this is different from directly differentiating a full-vocabulary KL.
+
+```python
+from trl import DistillationConfig, DistillationTrainer
+
+args = DistillationConfig(
+    output_dir="vopd",
+    loss_type="vopd",
+    vopd_top_k=100,  # 0 for the full-vocabulary baseline
+    temperature=1.0,
+    top_p=1.0,
+    top_k=0,  # generation samples the full distribution
+)
+trainer = DistillationTrainer(
+    model="Qwen/Qwen3-0.6B",
+    teacher_model="Qwen/Qwen3-4B",
+    args=args,
+    train_dataset=dataset,  # a prompt-only dataset
+)
+trainer.train()
+```
+
+For `vopd_top_k > 0`, both distributions are renormalized on the **student's** top-k support, selected without
+gradients. Only this baseline is approximated; the sampled-token reward uses full-distribution log probabilities,
+including when the sampled token is outside the support. A value of 1 gives a zero baseline; a value at least as
+large as the vocabulary gives the full baseline. The same tokenizer and vocabulary mapping are required.
+
+Both variants reuse the chunked teacher/student projections, limiting peak logits memory to the configured
+internal chunk size. Generation may use Transformers or the existing student vLLM backend; teacher scoring remains
+local; `ServerDistillationTrainer` rejects this loss. `beta=1.0` is required. Truncated sampling, repetition penalties, constrained vLLM generation, and `generation_kwargs` overrides are
+rejected so the sampling distribution matches the score-function gradient. The unbiasedness claim is for the
+conditional token gradient with on-policy sampling; it does not promise lower variance for every distribution.

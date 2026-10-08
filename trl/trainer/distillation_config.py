@@ -130,6 +130,10 @@ class DistillationConfig(_BaseConfig):
 
         > Parameters that control the training
 
+        loss_type (`str`, *optional*, defaults to `"jsd"`):
+            `"jsd"` for generalized JSD or `"vopd"` for on-policy distillation with a detached reverse-KL baseline.
+        vopd_top_k (`int`, *optional*, defaults to `0`):
+            Number of student top-k tokens used for the vOPD baseline. `0` uses the full vocabulary.
         beta (`float`, *optional*, defaults to `1.0`):
             Interpolation coefficient for the Generalized Jensen-Shannon Divergence loss. When `0.0`, the loss is the
             forward KL divergence. When `1.0`, the loss is the reverse KL divergence. When `0.5`, it is the standard
@@ -351,6 +355,10 @@ class DistillationConfig(_BaseConfig):
     )
 
     # Parameters that control the training
+    loss_type: str = field(default="jsd", metadata={"help": "Distillation objective: jsd or vopd."})
+    vopd_top_k: int = field(
+        default=0, metadata={"help": "Student top-k support for the vOPD baseline; 0 uses the full vocabulary."}
+    )
     beta: float = field(
         default=1.0,
         metadata={
@@ -391,6 +399,22 @@ class DistillationConfig(_BaseConfig):
 
     def __post_init__(self):
         super().__post_init__()
+
+        if self.loss_type not in {"jsd", "vopd"}:
+            raise ValueError("loss_type must be jsd or vopd.")
+        if self.vopd_top_k < 0:
+            raise ValueError("vopd_top_k must be nonnegative.")
+        if self.loss_type == "vopd":
+            if self.beta != 1.0:
+                raise ValueError("vOPD uses reverse KL; beta must be 1.0.")
+            if self.temperature <= 0:
+                raise ValueError("vOPD requires a positive sampling temperature.")
+            if self.top_p != 1.0 or self.top_k > 0 or self.min_p not in (None, 0.0) or self.repetition_penalty != 1.0:
+                raise ValueError("vOPD requires top_p=1, top_k=0, min_p=0 or None, and repetition_penalty=1.")
+            if self.vllm_structured_outputs_regex is not None:
+                raise ValueError("vOPD does not support constrained generation with vllm_structured_outputs_regex.")
+            if self.generation_kwargs:
+                raise ValueError("generation_kwargs overrides are not supported with vOPD.")
 
         if self.beta < 0.0 or self.beta > 1.0:
             raise ValueError(f"beta must be in [0.0, 1.0], got {self.beta}.")
