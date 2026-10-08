@@ -2,7 +2,7 @@
 
 **Author:** [Jacob Helwig](https://jacobhelwig.github.io/)
 
-Last updated: 05/26/2026.
+Last updated: 10/07/2026.
 
 ## Background
 
@@ -777,3 +777,67 @@ The returned scalar loss is what `engine.train_batch` backpropagates.
 - `tests/workers/test_distillation_topk_symmetry_on_cpu.py` — top-k loss symmetry and overlap metric checks
 - `tests/utils/test_special_megatron_kl_loss_tp.py` — Megatron KL loss and overlap metrics under tensor parallelism
 - `tests/special_e2e/run_v1_separate_async_opd.sh` — end-to-end multi-teacher OPD on the V1 separate_async trainer
+
+## vOPD: distillation with a control variate baseline
+
+[KL for a KL: On-Policy Distillation with Control Variate Baseline](https://arxiv.org/abs/2605.07865)
+uses the per-token advantage
+
+```text
+A = stop_gradient(log teacher(sampled_token) - log student(sampled_token) + baseline_KL)
+```
+
+The existing distillation policy-gradient loss consumes this advantage. `vopd_topk`
+renormalizes both distributions on the student's rollout top-k support to compute
+`baseline_KL`; `vopd_full` computes the baseline over the entire vocabulary. Both
+keep the sampled-token reward normalized over the full vocabulary. In particular,
+the sampled token is never appended to the baseline support. The baseline and
+teacher scores are detached. No critic or group normalization is used for this signal.
+
+### Supported configuration
+
+The initial implementation supports FSDP/FSDP2 actors, a vLLM teacher, text-only
+single-turn rollouts, temperature 1, and untruncated sampling. Student and teacher
+must share the same tokenizer and vocabulary-ID mapping. Fused model kernels and
+static `pad_to_length` are rejected because this implementation reads actor logits.
+Set `use_policy_gradient=True`, `loss_max_clamp=null`, and `log_prob_min_clamp=null`.
+Megatron and other teacher engines are not supported.
+
+```bash
+# From the verl root, after preparing the datasets used by the existing OPD recipe.
+# Model, GPU, dataset, and batch overrides are passed through to that recipe.
+VOPD_TOPK=20 bash examples/on_policy_distillation_trainer/run_vopd_fsdp.sh
+
+# Small-context full-vocabulary experiment. Start with a small batch and short response.
+VOPD_MODE=vopd_full TRAIN_BATCH_SIZE=2 PPO_MINI_BATCH_SIZE=2 \
+MAX_PROMPT_LENGTH=32 MAX_RESPONSE_LENGTH=32 \
+bash examples/on_policy_distillation_trainer/run_vopd_fsdp.sh
+```
+
+Top-k uses the rollout's `response_topk_ids`. vLLM 0.29 can return selected output
+token scores through `logprob_token_ids`, but cannot return a different selected
+support at each prompt position. The teacher client therefore requests one token
+on each student prefix, selecting the student's k IDs plus the actual sampled ID.
+It discards the teacher-generated token and retains the requested scores. Requests
+are bounded to eight in flight per teacher manager. Prefix caching can reduce repeated
+prefill work; this remains a latency-heavy path requiring throughput measurement
+before large runs. The score payload is O(Tk), and k must be between 1 and 127 due
+to vLLM 0.29's 128 selected-ID limit. The default example uses k=20 from the paper.
+
+Full-V is available with `prompt_logprobs=-1` and `max_logprobs=-1`. Returned
+teacher scores are reordered by vocabulary ID, shifted to prediction positions,
+and checked for complete vocabulary coverage. This transfers O(TV) scores and
+IDs, including prompt positions: approximately 2.3 GiB per 2,048-token sequence
+with V=150,000, before temporary buffers and batching. It is an experimental
+short-context path. The actor streams its full-V baseline through 256-token chunks
+to bound temporary FP32 softmax memory; the teacher payload itself remains O(TV).
+
+The top-k support is captured at rollout time. With one on-policy update it is
+the student's support; with policy reuse it is a fixed approximate support from
+the rollout policy. It remains independent of the sampled token. PPO clipping,
+stale rollouts, rollout corrections, and task rewards have their usual effects:
+only the detached baseline itself preserves the expected conditional token gradient.
+`use_task_rewards=False` gives pure distillation; the example sets this through
+the existing OPD launcher. The paper's value baseline is a practical approximation
+to the gradient-norm-weighted variance-optimal baseline, not a universal guarantee
+of lower variance on every context.

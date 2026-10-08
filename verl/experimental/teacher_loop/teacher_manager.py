@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import logging
 import os
 from typing import Any, Optional
@@ -49,6 +50,8 @@ def _get_teacher_sampling_params(
             teacher_model_config.inference.temperature,
         )
     num_logprobs = distillation_loss_config.topk if distillation_loss_config.loss_settings.use_topk else 0
+    if distillation_loss_config.loss_mode == "vopd_full":
+        num_logprobs = -1
     return {
         "max_tokens": 1,
         "temperature": 1.0,
@@ -96,6 +99,8 @@ class AsyncTeacherLLMServerManager:
                 f"do not match teacher routing keys {sorted(expected)}."
             )
         self.teacher_client: dict[str, LLMServerClient] = teacher_client
+        # Bound selective scoring across all trajectories handled by this manager.
+        self._vopd_semaphore = asyncio.Semaphore(8)
 
     def _resolve_teacher_key(self, routing_key: Optional[str]) -> str:
         if len(self.teacher_model_configs) == 1:
@@ -120,12 +125,18 @@ class AsyncTeacherLLMServerManager:
         mm_processor_kwargs: Optional[dict[str, Any]] = None,
         mm_processor_output: Optional[list[dict[str, Any]]] = None,
         routing_key: Optional[str] = None,
+        student_topk_ids: Optional[list[list[int]]] = None,
+        prompt_length: Optional[int] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute teacher log probabilities for a single unpadded sequence."""
         multi_modal_data = multi_modal_data or {}
         teacher_key = self._resolve_teacher_key(routing_key)
         teacher_model_config = self.teacher_model_configs[teacher_key]
         client = self.teacher_client[teacher_key]
+        if self.distillation_loss_config.loss_mode == "vopd_topk":
+            if multi_modal_data:
+                raise NotImplementedError("vOPD selective prefix scoring currently supports text-only sequences.")
+            return await self._score_student_support(client, sequence_ids, student_topk_ids, prompt_length)
         teacher_output = await client.generate(
             request_id=uuid4().hex,
             prompt_ids=sequence_ids,
@@ -142,3 +153,73 @@ class AsyncTeacherLLMServerManager:
         teacher_logprobs = torch.tensor(teacher_output.extra_fields["prompt_logprobs"])
         assert teacher_ids.shape[0] == teacher_logprobs.shape[0] == len(sequence_ids)
         return teacher_ids, teacher_logprobs
+
+    async def _score_student_support(
+        self,
+        client: LLMServerClient,
+        sequence_ids: list[int],
+        student_topk_ids: Optional[list[list[int]]],
+        prompt_length: Optional[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Score each student support with a one-token vLLM request on its prefix.
+
+        vLLM 0.29 supports selected output logprobs, but not per-position selected
+        prompt logprobs. Prefix requests bound score transfer to O(T*k), at the
+        cost of T prefills. Prefix caching on the teacher can amortize those prefills.
+        """
+        k = self.distillation_loss_config.topk
+        if prompt_length is None or not 1 <= prompt_length <= len(sequence_ids) or student_topk_ids is None:
+            raise ValueError("vOPD top-k requires the student rollout's response_topk_ids and prompt length.")
+        response_length = len(sequence_ids) - prompt_length
+        if response_length == 0:
+            ids = torch.cat([torch.arange(k), torch.zeros(1, dtype=torch.long)]).repeat(len(sequence_ids), 1)
+            return ids.to(torch.int32), torch.zeros(len(sequence_ids), k + 1)
+        support = torch.as_tensor(student_topk_ids, dtype=torch.long)
+        if support.shape != (response_length, k):
+            raise ValueError(f"Expected student top-k shape {(response_length, k)}, got {tuple(support.shape)}.")
+        if (support.sort(-1).values.diff(dim=-1) == 0).any():
+            raise ValueError("Student top-k support must contain k distinct tokens at each position.")
+        # Dummy prompt/last rows are masked out. Give them a valid distinct support.
+        ids = torch.cat([torch.arange(k), torch.zeros(1, dtype=torch.long)]).repeat(len(sequence_ids), 1)
+        scores = torch.zeros(len(sequence_ids), k + 1)
+
+        async def score_position(index):
+            position = prompt_length + index
+            requested = support[index].tolist() + [sequence_ids[position]]
+            # The sampled token may already be in the baseline support. Query it once,
+            # then restore a separate final column so it never changes that support.
+            unique = list(dict.fromkeys(requested))
+            async with self._vopd_semaphore:
+                output = await client.generate(
+                    request_id=uuid4().hex,
+                    prompt_ids=sequence_ids[:position],
+                    sampling_params={
+                        "max_tokens": 1,
+                        "temperature": 1.0,
+                        "detokenize": False,
+                        "logprob_token_ids": unique,
+                    },
+                )
+            returned = output.extra_fields["requested_token_logprobs"]
+            if len(returned) != len(unique):
+                raise ValueError("Teacher did not return all requested token scores.")
+            by_id = dict(zip(unique, returned, strict=True))
+            ids[position - 1] = torch.tensor(requested)
+            scores[position - 1] = torch.tensor([by_id[token] for token in requested])
+
+        # A fixed worker count also avoids creating one task per response token.
+        positions = iter(range(response_length))
+
+        async def score_positions():
+            for index in positions:
+                await score_position(index)
+
+        tasks = [asyncio.create_task(score_positions()) for _ in range(min(8, response_length))]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            # A failed/cancelled trajectory must not leave teacher requests running.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        return ids.to(torch.int32), scores

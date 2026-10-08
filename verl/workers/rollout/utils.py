@@ -265,3 +265,62 @@ def update_prometheus_config(config: PrometheusConfig, server_addresses: list[st
 
     except Exception as e:
         logger.error(f"Failed to update Prometheus configuration: {e}")
+
+
+def extract_prompt_logprobs(output, num_prompt_logprobs: int | None, result_dict: dict[str, list]):
+    """Extract prompt log probabilities from generation output."""
+    if num_prompt_logprobs is None:
+        return
+
+    prompt_logprobs_ls, prompt_ids_ls = [], []
+    full_vocab_size = None
+    # NOTE: logprob of first prompt token is None.
+    for logprobs_dict in output.prompt_logprobs[1:]:
+        if num_prompt_logprobs == -1:
+            vocab_size = len(logprobs_dict)
+            if not all(token in logprobs_dict for token in range(vocab_size)):
+                raise ValueError("Full-vocabulary prompt logprobs must cover contiguous vocabulary IDs.")
+            if full_vocab_size is not None and vocab_size != full_vocab_size:
+                raise ValueError("Full-vocabulary prompt logprobs changed vocabulary size across positions.")
+            if full_vocab_size is None:
+                full_vocab_size = vocab_size
+                token_ids = list(range(vocab_size))
+            prompt_ids_ls.append(token_ids)
+            prompt_logprobs_ls.append([logprobs_dict[token].logprob for token in token_ids])
+        elif num_prompt_logprobs == 0:
+            token_id_str = list(logprobs_dict.keys())[0]
+            logprob = logprobs_dict[token_id_str].logprob
+            prompt_logprobs_ls.append([logprob])
+            prompt_ids_ls.append([int(token_id_str)])
+        else:
+            prompt_ids = [None] * num_prompt_logprobs
+            prompt_logprobs = [None] * num_prompt_logprobs
+            # We get either top-k logprobs or top-k plus the sampled logprob (if sampled token is not in top-k)
+            assert len(logprobs_dict) in [num_prompt_logprobs, num_prompt_logprobs + 1], len(logprobs_dict)
+            for token_id_str, token_logprob in logprobs_dict.items():
+                rank = token_logprob.rank
+                if rank > num_prompt_logprobs:
+                    continue  # the sampled token is not in the top-k
+                logprob = token_logprob.logprob
+                prompt_ids[rank - 1] = int(token_id_str)
+                prompt_logprobs[rank - 1] = logprob
+            prompt_logprobs_ls.append(prompt_logprobs)
+            prompt_ids_ls.append(prompt_ids)
+
+    # NOTE: pad a dummy prompt logprob for last prompt token.
+    if num_prompt_logprobs == -1:
+        if full_vocab_size is None:
+            raise ValueError("Full-vocabulary scoring requires at least two prompt tokens.")
+        prompt_logprobs_ls.append([0.0] * full_vocab_size)
+        prompt_ids_ls.append(list(range(full_vocab_size)))
+    else:
+        prompt_logprobs_ls.append([0.0] * max(num_prompt_logprobs, 1))
+        prompt_ids_ls.append([0] * max(num_prompt_logprobs, 1))
+
+    result_dict["prompt_ids"] = prompt_ids_ls
+    result_dict["prompt_logprobs"] = prompt_logprobs_ls
+
+
+def extract_requested_token_logprobs(logprobs, token_ids: list[int]) -> list[float]:
+    """Read vLLM selective scores in request order, excluding its extra sampled token."""
+    return [logprobs[token].logprob for token in token_ids]

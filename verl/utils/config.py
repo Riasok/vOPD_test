@@ -117,6 +117,34 @@ def _validate_score_centering_config(config: DictConfig) -> None:
         raise ValueError("score centering cannot be combined with distillation.")
 
 
+def _validate_vopd_config(config: DictConfig) -> None:
+    distillation = config.get("distillation") or {}
+    loss = distillation.get("distillation_loss") or {}
+    if not distillation.get("enabled", False) or loss.get("loss_mode") not in {"vopd_topk", "vopd_full"}:
+        return
+    actor = config.actor_rollout_ref.actor
+    rollout = config.actor_rollout_ref.rollout
+    if actor.strategy not in {"fsdp", "fsdp2"}:
+        raise ValueError("vOPD currently supports the FSDP/FSDP2 actor engine only.")
+    if config.actor_rollout_ref.model.get("use_fused_kernels", False) or actor.get("use_fused_kernels", False):
+        raise ValueError("vOPD requires use_fused_kernels=False to compute its detached baseline from logits.")
+    if actor.get("pad_to_length", False) or actor.get("fsdp_config", {}).get("pad_to_length", False):
+        raise ValueError("vOPD does not support pad_to_length.")
+    if not rollout.do_sample or rollout.temperature != 1.0 or rollout.top_p != 1.0 or rollout.top_k != -1:
+        raise ValueError("vOPD currently requires rollout do_sample=True, temperature=1, top_p=1, top_k=-1.")
+    if rollout.get("repetition_penalty", 1.0) != 1.0:
+        raise ValueError("vOPD requires repetition_penalty=1.")
+    if rollout.agent.default_agent_loop != "single_turn_agent" or rollout.multi_turn.enable:
+        raise ValueError("vOPD currently supports single-turn rollouts only.")
+    if loss.loss_mode == "vopd_topk":
+        if rollout.name != "vllm" or rollout.get("topk_log_probs", 0) != loss.topk:
+            raise ValueError("vopd_topk requires vLLM rollout.topk_log_probs equal to distillation_loss.topk.")
+        if not rollout.calculate_log_probs or rollout.logprobs_mode != "processed_logprobs":
+            raise ValueError(
+                "vopd_topk requires calculate_log_probs=True and rollout.logprobs_mode=processed_logprobs."
+            )
+
+
 def validate_config(
     config: DictConfig,
     use_reference_policy: bool,
@@ -197,6 +225,7 @@ def validate_config(
     actor_config.validate(n_gpus, config.data.train_batch_size, config.actor_rollout_ref.model)
     _validate_router_replay_config(actor_config, config.algorithm.get("rollout_correction", None))
     _validate_score_centering_config(config)
+    _validate_vopd_config(config)
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if use_reference_policy:

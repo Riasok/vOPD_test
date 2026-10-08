@@ -103,6 +103,14 @@ class DistillationLossConfig(BaseConfig):
 
         self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
 
+        if self.loss_mode in {"vopd_topk", "vopd_full"}:
+            if not self.use_policy_gradient:
+                raise ValueError("vOPD requires use_policy_gradient=True.")
+            if self.loss_max_clamp is not None or self.log_prob_min_clamp is not None:
+                raise ValueError("vOPD requires loss_max_clamp=null and log_prob_min_clamp=null.")
+            if self.loss_mode == "vopd_topk" and (self.topk is None or not 1 <= self.topk <= 127):
+                raise ValueError("vOPD topk must be in [1, 127] for vLLM selective scoring (k+1 <= 128).")
+
         if self.policy_loss_mode != "vanilla":
             raise NotImplementedError(
                 f"Only vanilla policy loss is currently supported when use_policy_gradient is True, "
@@ -271,10 +279,19 @@ class DistillationConfig(BaseConfig):
             return
 
         self.teacher_models = self._resolve_teacher_models()
+        vopd_full = self.distillation_loss.loss_mode == "vopd_full"
+        vopd_topk = self.distillation_loss.loss_mode == "vopd_topk"
         teacher_world_size_sum = 0
         for teacher_model in self.teacher_models.values():
+            if vopd_full or vopd_topk:
+                if teacher_model.inference.name != "vllm":
+                    raise ValueError("vOPD teacher scoring currently requires vLLM.")
+                if teacher_model.inference.logprobs_mode != "raw_logprobs":
+                    raise ValueError("vOPD requires teacher inference.logprobs_mode=raw_logprobs.")
+                if vopd_full:
+                    teacher_model.inference.engine_kwargs.setdefault("vllm", {})["max_logprobs"] = -1
             teacher_model.validate_and_prepare_for_distillation(
-                use_topk=self.distillation_loss.loss_settings.use_topk,
+                use_topk=self.distillation_loss.loss_settings.use_topk and not vopd_full,
                 topk=self.distillation_loss.topk,
             )
             teacher_world_size_sum += teacher_model.world_size

@@ -612,6 +612,10 @@ class AgentLoopWorker:
             logprobs=config.calculate_log_probs,
         )
 
+        # the trainer never consumes the sampler head on validation rollouts
+        if config.topk_log_probs and not validate:
+            sampling_params["topk_log_probs"] = config.topk_log_probs
+
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
             params["top_p"] = 1.0
             params["top_k"] = -1
@@ -1055,6 +1059,11 @@ class AgentLoopWorker:
     ) -> None:
         """Compute teacher logprobs for single sample."""
         if self.distillation_enabled and not validate:
+            if self.teacher_server_manager.distillation_loss_config.loss_mode in {"vopd_topk", "vopd_full"}:
+                if output.num_turns > 2:
+                    raise ValueError("vOPD currently supports single-turn rollouts only.")
+                if output.multi_modal_data:
+                    raise NotImplementedError("vOPD currently supports text-only rollouts.")
             routing_key = None
             if sample_kwargs is not None:
                 routing_value = sample_kwargs.get(self.teacher_key)
@@ -1067,6 +1076,8 @@ class AgentLoopWorker:
                 mm_processor_kwargs=output.mm_processor_kwargs,
                 mm_processor_output=getattr(output, "mm_processor_output", None),
                 routing_key=routing_key,
+                student_topk_ids=output.extra_fields.get("response_topk_ids"),
+                prompt_length=len(prompt_ids),
             )
             output.extra_fields["teacher_ids"] = teacher_ids
             output.extra_fields["teacher_logprobs"] = teacher_logprobs

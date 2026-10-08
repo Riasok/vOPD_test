@@ -248,3 +248,69 @@ def test_forward_kl_topk_metric_aggregation_for_overlap_outputs():
 
     assert metrics["distillation/overlap_ratio"] == pytest.approx(0.75)
     assert metrics["distillation/overlap_token_advantage"] == pytest.approx(-0.3)
+
+
+@pytest.mark.parametrize("use_remove_padding", [True, False])
+@pytest.mark.parametrize("mode", ["vopd_topk", "vopd_full"])
+def test_vopd_baseline_through_fsdp_output_processor(use_remove_padding, mode, monkeypatch):
+    from transformers.modeling_outputs import CausalLMOutput
+
+    from verl.trainer.distillation.losses import compute_topk_loss
+    from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
+
+    monkeypatch.setenv("VERL_DISABLE_FLASH_ATTN_CE", "1")
+    offsets = torch.tensor([0, 3, 5])
+    tokens = torch.tensor([1, 2, 3, 1, 4])
+    logits = torch.randn(1, 5, _VOCAB_SIZE, requires_grad=True)
+    teacher_logps = torch.randn_like(logits).log_softmax(-1)
+    labels = tokens.roll(-1)
+    if mode == "vopd_topk":
+        support = logits.detach().topk(2, -1).indices
+        teacher_ids = torch.cat([support, labels.view(1, -1, 1)], -1)
+        teacher_logps = teacher_logps.gather(-1, teacher_ids)
+    else:
+        teacher_ids = torch.arange(_VOCAB_SIZE).expand(1, 5, _VOCAB_SIZE)
+    data = TensorDict(
+        {
+            "input_ids": torch.nested.nested_tensor_from_jagged(tokens, offsets),
+            "teacher_ids": torch.nested.nested_tensor_from_jagged(teacher_ids.squeeze(0), offsets),
+            "teacher_logprobs": torch.nested.nested_tensor_from_jagged(teacher_logps.squeeze(0), offsets),
+        },
+        batch_size=[],
+    )
+    tu.assign_non_tensor(
+        data,
+        use_remove_padding=use_remove_padding,
+        pad_mode=DatasetPadMode.NO_PADDING,
+        use_fused_kernels=False,
+        calculate_entropy=False,
+        calculate_sum_pi_squared=False,
+        distillation_use_topk=True,
+        distillation_only=False,
+    )
+    actor = ActorConfig(strategy="fsdp", rollout_n=1, use_dynamic_bsz=True)
+    config = DistillationConfig(
+        distillation_loss=DistillationLossConfig(
+            loss_mode=mode, topk=2, use_policy_gradient=True, loss_max_clamp=None, log_prob_min_clamp=None
+        )
+    )
+
+    def processor(student_logits, data):
+        return compute_topk_loss(actor, config, data, student_logits, "thd")
+
+    expected = processor(logits, data)
+    if use_remove_padding:
+        output = CausalLMOutput(logits=logits)
+        args = {"input_ids_rmpad_rolled": labels, "temperature_rmpad": torch.ones(5), "pad_size": 0}
+    else:
+        padded = torch.stack([logits[0, :3], torch.cat([logits[0, 3:], torch.zeros(1, _VOCAB_SIZE)])])
+        output = CausalLMOutput(logits=padded)
+        args = {"input_ids_rmpad_rolled": labels, "temperature": torch.ones(2)}
+    model_output = _make_engine_stub().prepare_model_outputs(output, args, data, processor)
+    for key, value in expected.items():
+        torch.testing.assert_close(model_output[key].values(), value.squeeze(0))
+        assert not model_output[key].requires_grad
+    reference_logps = logits.log_softmax(-1).gather(-1, labels.view(1, -1, 1)).reshape(-1)
+    torch.testing.assert_close(model_output["log_probs"].values(), reference_logps)
+    model_output["log_probs"].values().sum().backward()
+    assert logits.grad is not None and torch.isfinite(logits.grad).all()

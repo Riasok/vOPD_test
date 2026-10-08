@@ -56,6 +56,7 @@ from verl.utils.vllm.vllm_quant_utils import apply_vllm_quant_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
 from verl.workers.rollout.utils import (
+    extract_requested_token_logprobs,
     extract_response_topk_logprobs,
     get_max_position_embeddings,
     get_vision_placeholder_token_ids,
@@ -725,6 +726,12 @@ class vLLMHttpServer:
             num_prompt_logprobs=sampling_params.prompt_logprobs,
             result_dict=extra_fields,
         )
+        if sampling_params.logprob_token_ids is not None:
+            # Selective teacher scoring: preserve request order, ignoring the extra sampled token.
+            requested_logprobs = final_res.outputs[0].logprobs[0]
+            extra_fields["requested_token_logprobs"] = extract_requested_token_logprobs(
+                requested_logprobs, sampling_params.logprob_token_ids
+            )
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs:

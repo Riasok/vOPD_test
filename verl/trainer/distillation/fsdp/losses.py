@@ -15,6 +15,7 @@
 
 import torch
 import torch.nn.functional as F
+from tensordict import TensorDict
 
 from verl.utils.ulysses import (
     get_ulysses_sequence_parallel_world_size,
@@ -147,3 +148,50 @@ def compute_forward_kl_topk(
         "overlap_count": overlap_count,
         "overlap_token_advantage": overlap_token_advantage,
     }
+
+
+@torch.no_grad()
+def compute_vopd_baseline(
+    student_logits: torch.Tensor,
+    data: TensorDict,
+    config: DistillationConfig,
+    chunk_size: int = 256,
+) -> dict[str, torch.Tensor]:
+    """Compute a detached reverse-KL baseline and the teacher's sampled-token score.
+
+    For vopd_topk, teacher columns are [student rollout top-k, sampled token].
+    The final sampled-token column is excluded from the baseline support.
+    For vopd_full, teacher columns are in vocabulary-ID order. Stream the
+    full-vocabulary softmax in token chunks to bound temporary FP32 memory.
+    """
+    teacher_log_probs = data["teacher_logprobs"].values().unsqueeze(0).detach()
+    if get_ulysses_sequence_parallel_world_size() > 1:
+        teacher_log_probs = slice_input_tensor(teacher_log_probs, dim=1)
+    if teacher_log_probs.shape[:2] != student_logits.shape[:2]:
+        raise ValueError("vOPD teacher scores must align with student prediction positions.")
+    if config.distillation_loss.loss_mode == "vopd_topk":
+        topk = config.distillation_loss.topk
+        if teacher_log_probs.shape[-1] != topk + 1:
+            raise ValueError("vOPD top-k requires k baseline columns plus a separate sampled-token column.")
+        support_ids = data["teacher_ids"].values()[..., :topk].unsqueeze(0).long()
+        if get_ulysses_sequence_parallel_world_size() > 1:
+            support_ids = slice_input_tensor(support_ids, dim=1)
+        student_log_probs = F.log_softmax(student_logits.gather(-1, support_ids).float(), dim=-1)
+        teacher_support_log_probs = F.log_softmax(teacher_log_probs[..., :topk].float(), dim=-1)
+        baseline = (student_log_probs.exp() * (student_log_probs - teacher_support_log_probs)).sum(-1)
+        teacher_sample_logps = teacher_log_probs[..., -1].float()
+    else:
+        if teacher_log_probs.shape[-1] != student_logits.shape[-1]:
+            raise ValueError("vOPD full vocabulary requires identical teacher and student vocabulary sizes.")
+        labels = data["input_ids"].values().roll(-1).unsqueeze(0)
+        if get_ulysses_sequence_parallel_world_size() > 1:
+            labels = slice_input_tensor(labels, dim=1)
+        teacher_sample_logps = teacher_log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1).float()
+        baseline = student_logits.new_empty(student_logits.shape[:2], dtype=torch.float32)
+        for start in range(0, student_logits.shape[1], chunk_size):
+            end = start + chunk_size
+            student_log_probs = F.log_softmax(student_logits[:, start:end].float(), dim=-1)
+            # Full teacher scores already carry the full-vocabulary normalizer.
+            teacher_chunk = teacher_log_probs[:, start:end].float()
+            baseline[:, start:end] = (student_log_probs.exp() * (student_log_probs - teacher_chunk)).sum(-1)
+    return {"vopd_baseline": baseline, "vopd_teacher_sample_logps": teacher_sample_logps}

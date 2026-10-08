@@ -139,8 +139,17 @@ def compute_topk_loss(
         case "fsdp" | "veomni" | "fsdp2":
             import verl.trainer.distillation.fsdp.losses as fsdp_losses
 
+            if distillation_config.distillation_loss.loss_mode in {"vopd_topk", "vopd_full"}:
+                if config.strategy not in {"fsdp", "fsdp2"}:
+                    raise NotImplementedError("vOPD currently requires the FSDP/FSDP2 actor engine.")
+                outputs = fsdp_losses.compute_vopd_baseline(student_logits, data, distillation_config)
+                for value in outputs.values():
+                    assert value.shape == student_logits.shape[:2]
+                return outputs
             distillation_loss_fn = fsdp_losses.compute_forward_kl_topk
         case "megatron":
+            if distillation_config.distillation_loss.loss_mode in {"vopd_topk", "vopd_full"}:
+                raise NotImplementedError("vOPD currently requires the FSDP actor engine.")
             import verl.trainer.distillation.megatron.losses as megatron_losses
 
             distillation_loss_fn = megatron_losses.compute_forward_kl_topk
@@ -403,3 +412,28 @@ def compute_distillation_loss_reverse_kl_estimator(
         "distillation/abs_loss": Metric(AggregationType.MEAN, distillation_losses[response_mask_bool].abs().mean()),
     }
     return distillation_losses, metrics
+
+
+@register_distillation_loss(DistillationLossSettings(names=["vopd_topk", "vopd_full"], use_topk=True))
+def compute_vopd_loss(
+    config: ActorConfig,
+    distillation_config: DistillationConfig,
+    model_output: dict,
+    data: TensorDict,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Return the negative vOPD advantage for the existing policy-gradient reduction.
+
+    The sampled log-probabilities retain their full-vocabulary normalization.
+    Only the action-independent KL baseline is renormalized over a top-k support.
+    """
+    student_log_probs = no_padding_2_padding(model_output["log_probs"], data)
+    teacher_log_probs = no_padding_2_padding(model_output["vopd_teacher_sample_logps"], data)
+    baseline = no_padding_2_padding(model_output["vopd_baseline"], data)
+    mask = data["response_mask"]
+    if mask.is_nested:
+        mask = mask.to_padded_tensor(False)
+    losses = student_log_probs - teacher_log_probs.detach() - baseline.detach()
+    metrics = {
+        "distillation/vopd_baseline": Metric(AggregationType.MEAN, (baseline * mask).sum() / mask.sum().clamp_min(1))
+    }
+    return losses, metrics
